@@ -12,6 +12,7 @@ const KEY = "fuse_token";
 const $ = (id) => document.getElementById(id);
 let token = localStorage.getItem(KEY) || "";
 let timer = null;
+let me = null;
 
 /* ---------------- API helper ---------------- */
 async function api(path, opts = {}) {
@@ -45,7 +46,7 @@ async function login() {
   $("login-error").classList.add("hidden");
   try {
     token = t;
-    const me = await api("/user");
+    me = await api("/user");
     localStorage.setItem(KEY, t);
     $("user-avatar").src = me.avatar_url;
     $("user-login").textContent = me.login;
@@ -230,7 +231,131 @@ async function showConnectionInfo(runId, btn) {
   }
 }
 
-function refreshAll() { loadRuns(); loadCodespaces(); }
+function refreshAll() { loadRuns(); loadCodespaces(); if (!billMonth) loadBilling(); }
+
+
+/* ---------------- billing & usage ---------------- */
+const LS_LIMITS = "fuse_limits";
+let billMonth = null; // {y, m} while navigating
+function nowYM() { const d = new Date(); return { y: d.getUTCFullYear(), m: d.getUTCMonth() + 1 }; }
+function loadLimits() {
+  try { return JSON.parse(localStorage.getItem(LS_LIMITS)) || null; } catch { return null; }
+}
+function defaultLimits() {
+  const pro = me && me.plan && /pro/i.test(me.plan.name || "");
+  return { actionsMinutes: pro ? 3000 : 2000, codespacesCoreHours: 120, codespacesStorageGbMonth: 15 };
+}
+function getLimits() { return Object.assign(defaultLimits(), loadLimits() || {}); }
+
+function coresFromSku(sku) { const m = /(\d+)-core/i.exec(sku || ""); return m ? +m[1] : 1; }
+const usd = (n) => "$" + (n || 0).toFixed(2);
+
+async function loadBilling() {
+  const body = $("billing-body");
+  const { y, m } = billMonth || nowYM();
+  const lbl = new Date(Date.UTC(y, m - 1, 1)).toLocaleDateString(undefined, { month: "long", year: "numeric", timeZone: "UTC" });
+  $("bill-month-label").textContent = lbl;
+  try {
+    const data = await api(`/users/${me.login}/settings/billing/usage?year=${y}&month=${m}`);
+    const items = data.usageItems || [];
+
+    // aggregate
+    let actionsMin = 0, csCoreHrs = 0, csGbHrs = 0, gross = 0, discount = 0, net = 0;
+    const perDay = {};
+    for (const it of items) {
+      gross += it.grossAmount || 0; discount += it.discountAmount || 0; net += it.netAmount || 0;
+      const day = (it.date || "").slice(5, 10);
+      perDay[day] = perDay[day] || { a: 0, c: 0 };
+      if (it.product === "actions") {
+        actionsMin += it.quantity || 0;
+        perDay[day].a += it.quantity || 0;
+      } else if (it.product === "codespaces") {
+        if (/compute/i.test(it.sku || "")) {
+          const ch = (it.quantity || 0) * coresFromSku(it.sku);
+          csCoreHrs += ch; perDay[day].c += ch;
+        } else if (/storage/i.test(it.sku || "")) {
+          csGbHrs += it.quantity || 0;
+        }
+      }
+    }
+    renderBilling({ actionsMin, csCoreHrs, csGbHrs, gross, discount, net, perDay, y, m });
+  } catch (err) {
+    body.innerHTML = `<p class="error">Billing unavailable (${err.status || "network"}): ${err.message}.</p>
+      <p class="muted">The token may lack billing read access — for a fine-grained PAT add the account permission <code>Plans: Read</code>; for a classic PAT include the <code>user</code> scope.</p>`;
+  }
+}
+
+function metricBar(label, used, limit, unit, decimals = 0) {
+  const pct = limit > 0 ? (used / limit) * 100 : 100;
+  const cls = pct > 100 ? "over" : pct > 85 ? "warn" : "";
+  const left = Math.max(0, limit - used);
+  return `<div class="metric">
+    <div class="m-top"><span>${label}</span>
+      <span>${used.toFixed(decimals)} / ${limit.toLocaleString()} ${unit} used · <span class="m-left">left: ${left.toFixed(decimals)} ${unit}</span></span>
+    </div>
+    <div class="bar-track"><div class="bar-fill ${cls}" style="width:${Math.min(100, pct)}%"></div></div>
+  </div>`;
+}
+
+function renderBilling(t) {
+  const lim = getLimits();
+  const csGbMonth = t.csGbHrs / 730; // GB-hours -> GB-month
+  const body = $("billing-body");
+
+  // tiles
+  const tiles = `
+    <div class="tile"><div class="t-label">Actions minutes</div><div class="t-value">${Math.round(t.actionsMin).toLocaleString()}</div><div class="t-sub">of ${lim.actionsMinutes.toLocaleString()} included</div></div>
+    <div class="tile"><div class="t-label">Codespaces core-h</div><div class="t-value">${Math.round(t.csCoreHrs).toLocaleString()}</div><div class="t-sub">of ${lim.codespacesCoreHours.toLocaleString()} included</div></div>
+    <div class="tile"><div class="t-label">Codespaces storage</div><div class="t-value">${csGbMonth.toFixed(2)}<span style="font-size:12px"> GB-mo</span></div><div class="t-sub">of ${lim.codespacesStorageGbMonth.toLocaleString()} GB-mo included</div></div>
+    <div class="tile"><div class="t-label">Month net cost</div><div class="t-value">${usd(t.net)}</div><div class="t-sub">${usd(t.discount)} covered by included usage</div></div>`;
+
+  // daily usage chart
+  const days = new Date(Date.UTC(t.y, t.m, 0)).getUTCDate();
+  let max = 0;
+  const rows = [];
+  for (let d = 1; d <= days; d++) {
+    const key = String(t.m).padStart(2, "0") + "-" + String(d).padStart(2, "0");
+    const v = t.perDay[key] || { a: 0, c: 0 };
+    max = Math.max(max, v.a, v.c);
+    rows.push({ d, ...v });
+  }
+  const chart = rows.map((r) => {
+    const bars = (r.a || r.c)
+      ? `<div class="d-bar d-actions" style="height:${max ? (r.a / max) * 100 : 0}%"></div><div class="d-bar d-cs" style="height:${max ? (r.c / max) * 100 : 0}%"></div>`
+      : `<div class="d-zero"></div>`;
+    const mon = new Date(Date.UTC(t.y, t.m - 1, 1)).toLocaleDateString(undefined, { month: "short", timeZone: "UTC" });
+    return `<div class="day" title="${mon} ${r.d} · ${Math.round(r.a)} min actions · ${r.c.toFixed(2)} core-h codespaces">${bars}</div>`;
+  }).join("");
+  const legend = `<div class="chart-legend">
+    <span><span class="legend-dot" style="background:var(--accent)"></span>Actions minutes / day</span>
+    <span><span class="legend-dot" style="background:var(--warn)"></span>Codespaces core-hours / day</span>
+  </div>`;
+
+  body.innerHTML = `
+    <div class="tiles">${tiles}</div>
+    ${metricBar("Actions minutes", t.actionsMin, lim.actionsMinutes, "min")}
+    ${metricBar("Codespaces compute", t.csCoreHrs, lim.codespacesCoreHours, "core-h", 1)}
+    ${metricBar("Codespaces storage", csGbMonth, lim.codespacesStorageGbMonth, "GB-mo", 2)}
+    <div class="chart">${chart}</div>${legend}
+    <p class="b-cost">Gross ${usd(t.gross)} · covered ${usd(t.discount)} · net ${usd(t.net)} — from the GitHub billing usage report for this month.</p>`;
+}
+
+function shiftMonth(dir) {
+  const cur = billMonth || nowYM();
+  const d = new Date(Date.UTC(cur.y, cur.m - 1 + dir, 1));
+  billMonth = { y: d.getUTCFullYear(), m: d.getUTCMonth() + 1 };
+  loadBilling();
+}
+function toggleLimitsForm() {
+  const f = $("limits-form");
+  if (f.classList.contains("hidden")) {
+    const l = getLimits();
+    $("lim-actions").value = l.actionsMinutes;
+    $("lim-cs-hrs").value = l.codespacesCoreHours;
+    $("lim-cs-gb").value = l.codespacesStorageGbMonth;
+    f.classList.remove("hidden");
+  } else f.classList.add("hidden");
+}
 
 /* ---------------- wire up ---------------- */
 $("login-btn").addEventListener("click", login);
@@ -240,13 +365,26 @@ $("token-visibility").addEventListener("click", () => {
   i.type = i.type === "password" ? "text" : "password";
 });
 $("logout-btn").addEventListener("click", logout);
+$("bill-prev").addEventListener("click", () => shiftMonth(-1));
+$("bill-next").addEventListener("click", () => shiftMonth(1));
+$("limits-btn").addEventListener("click", toggleLimitsForm);
+$("limits-save").addEventListener("click", () => {
+  localStorage.setItem(LS_LIMITS, JSON.stringify({
+    actionsMinutes: +$("lim-actions").value || 0,
+    codespacesCoreHours: +$("lim-cs-hrs").value || 0,
+    codespacesStorageGbMonth: +$("lim-cs-gb").value || 0,
+  }));
+  $("limits-form").classList.add("hidden");
+  loadBilling();
+});
 $("dispatch-form").addEventListener("submit", dispatch);
 $("cs-create-btn").addEventListener("click", createCodespace);
 $("modal-close").addEventListener("click", () => $("modal").classList.add("hidden"));
 $("modal").addEventListener("click", (e) => { if (e.target === $("modal")) $("modal").classList.add("hidden"); });
 
 if (token) {
-  api("/user").then((me) => {
+  api("/user").then((u) => {
+    me = u;
     $("user-avatar").src = me.avatar_url;
     $("user-login").textContent = me.login;
     boot();

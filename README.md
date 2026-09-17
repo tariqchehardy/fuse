@@ -10,11 +10,12 @@
 - **Ignite a sovereign workstation** — dispatches the provisioning workflow with your chosen session duration, RDP credentials, and auto-shutdown. The Tailscale key is built in (`TS_AUTHKEY` repo secret); no pasting.
 - **Create a codespace exit node** — one button. Codespaces join the tailnet automatically as dedicated **ephemeral exit nodes**.
 - **Live status** — workstation runs and codespaces auto-refresh every 15 s; pull the connection info (Tailscale IP/hostname, RDP details) out of the run log.
+- **Billing & usage** — month-to-date Actions minutes, Codespaces core-hours and storage from the GitHub billing usage report, with limit progression bars (usage vs included quota and balance left), a daily usage graph, month navigation, and editable limits (auto-set from your plan; stored in localStorage).
 
 ## Token scopes
 
-- **Classic PAT:** `repo` + `workflow`
-- **Fine-grained PAT:** on the `sovereign-workstation` repository — `Actions: Read & write`, `Contents: Read-only`; plus the account permission `Codespaces: Read & write`
+- **Classic PAT:** `repo` + `workflow` (+ `user` if you want the billing section)
+- **Fine-grained PAT:** on the `sovereign-workstation` repository — `Actions: Read & write`, `Contents: Read-only`; plus the account permissions `Codespaces: Read & write` and `Plans: Read` (for billing)
 
 ## Notes
 

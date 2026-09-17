@@ -121,3 +121,34 @@ label .hint { color: var(--muted); font-weight: normal; }
 footer { text-align: center; color: var(--muted); font-size: 11px; padding: 18px; border-top: 1px solid var(--line); }
 .hidden { display: none !important; }
 @media (max-width: 600px) { header { padding: 14px 16px; } .grid { grid-template-columns: 1fr; } }
+
+/* ---------------- billing & usage ---------------- */
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.tile {
+  background: rgba(10,22,32,.55); border: 1px solid var(--line); border-radius: 10px;
+  padding: 12px 14px;
+}
+.tile .t-label { font-size: 11px; color: var(--muted); letter-spacing: .5px; text-transform: uppercase; }
+.tile .t-value { font-size: 20px; font-weight: bold; margin-top: 4px; }
+.tile .t-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.metric { margin-bottom: 16px; }
+.metric .m-top { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 6px; }
+.metric .m-left { color: var(--accent); }
+.bar-track { background: #0a1620; border: 1px solid var(--line); border-radius: 999px; height: 14px; overflow: hidden; }
+.bar-fill {
+  height: 100%; border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent2), var(--accent));
+  box-shadow: 0 0 10px rgba(0,212,160,.4);
+  transition: width .4s ease; min-width: 2px;
+}
+.bar-fill.warn { background: linear-gradient(90deg, #c78932, var(--warn)); box-shadow: 0 0 10px rgba(255,182,72,.4); }
+.bar-fill.over { background: linear-gradient(90deg, #c7405a, var(--danger)); box-shadow: 0 0 10px rgba(255,84,112,.4); }
+.chart { display: flex; align-items: flex-end; gap: 3px; height: 120px; padding: 10px 2px 0; border-bottom: 1px solid var(--line); margin-top: 6px; }
+.day { flex: 1; display: flex; align-items: flex-end; gap: 2px; height: 100%; min-width: 6px; }
+.day .d-bar { flex: 1; border-radius: 3px 3px 0 0; min-height: 2px; }
+.day .d-actions { background: var(--accent); opacity: .85; }
+.day .d-cs { background: var(--warn); opacity: .85; }
+.day .d-zero { background: rgba(29,58,82,.5); min-height: 2px; flex: 1; border-radius: 3px 3px 0 0; }
+.chart-legend { display: flex; gap: 16px; font-size: 11px; color: var(--muted); margin-top: 8px; }
+.legend-dot { display: inline-block; width: 9px; height: 9px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+.b-cost { font-size: 12px; color: var(--muted); margin-top: 12px; }

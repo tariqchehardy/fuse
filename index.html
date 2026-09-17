@@ -80,6 +80,24 @@
       <p id="dispatch-msg" class="hidden"></p>
     </section>
 
+    <section class="card" id="billing-card">
+      <h2>Billing &amp; Usage
+        <span class="refresh-note">
+          <button id="bill-prev" class="btn ghost sm" title="Previous month">&#9664;</button>
+          <span id="bill-month-label" class="muted"></span>
+          <button id="bill-next" class="btn ghost sm" title="Next month">&#9654;</button>
+          <button id="limits-btn" class="btn ghost sm">Set limits</button>
+        </span>
+      </h2>
+      <div id="billing-body"><p class="muted">Loading billing…</p></div>
+      <div id="limits-form" class="grid hidden">
+        <label>Actions minutes / month <input id="lim-actions" inputmode="numeric"></label>
+        <label>Codespaces core-hours / month <input id="lim-cs-hrs" inputmode="numeric"></label>
+        <label>Codespaces storage GB-month <input id="lim-cs-gb" inputmode="numeric"></label>
+        <div class="full"><button id="limits-save" class="btn primary sm">Save limits</button></div>
+      </div>
+    </section>
+
     <section class="card">
       <h2>Codespace Exit Nodes</h2>
       <p>Codespaces on <code>sovereign-workstation</code> come up automatically as dedicated <b>ephemeral Tailscale exit nodes</b> — no key pasting, no <code>tailscale up</code>.</p>
