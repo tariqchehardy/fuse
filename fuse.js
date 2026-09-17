@@ -260,16 +260,26 @@ const ago = (iso) => {
   return `${Math.floor(s / 3600)} h ago`;
 };
 function parseConnInfo(log) {
-  const grab = (re) => { const m = log.match(re); return m ? m[1].trim() : null; };
+  // The workflow echoes its own script source into the log, so the FIRST
+  // regex hit can be a source line ($tsHost, $env:SESSION_ID...). The real
+  // printed values always come later, so take the LAST match.
+  const grab = (re) => {
+    const ms = [...log.matchAll(re)];
+    return ms.length ? ms[ms.length - 1][1].trim() : null;
+  };
+  const target = grab(/RDP Target\s*[:=]\s*([0-9.]+:\d+)/);
+  const [tIp, tPort] = target ? target.split(":") : [null, null];
   return {
-    tsIp: grab(/Tailscale IP\s*[:=]\s*([0-9.]+)/),
-    tsHost: grab(/Tailscale Hostname\s*[:=]\s*(\S+)/),
-    tsDns: grab(/Tailscale DNS\s*[:=]\s*(\S+)/),
-    rdpUser: grab(/RDP Username\s*[:=]\s*(\S+)/i) || grab(/Username\s*[:=]\s*(\S+)/),
-    rdpPass: grab(/RDP Password\s*[:=]\s*(\S+)/i) || grab(/Password\s*[:=]\s*(\S+)/),
-    rdpPort: grab(/RDP Port\s*[:=]\s*(\d+)/) || grab(/Port\s*[:=]\s*(\d+)/),
-    shutdown: grab(/Shutdown scheduled for\s*(.+)/i),
-    duration: grab(/duration[^\d]*(\d+)\s*min/i),
+    tsIp: tIp || grab(/Tailscale IP\s*[:=]\s*([0-9.]+)/),
+    tsHost: grab(/Tailscale Host(?:name)?\s*[:=]\s*(\S+)/),
+    tsDns: grab(/Tailscale DNS(?: Name)?\s*[:=]\s*(\S+)/),
+    rdpUser: grab(/Username\s*[:=]\s*(\S+)/i),
+    rdpPass: grab(/Password\s*[:=]\s*(\S+)/i),
+    rdpPort: tPort || grab(/RDP Port\s*[:=]\s*(\d+)/i) || grab(/Port\s*[:=]\s*(\d+)/),
+    duration: grab(/Duration\s*[:=]\s*(\d+)\s*min/i) || grab(/IN_DURATION\s*[:=]\s*(\d+)/),
+    warning: grab(/Warning at\s*[:=]\s*(\S+\s+\S+)/),
+    sessionId: grab(/Session ID\s*[:=]\s*(\S+)/),
+    autoShutdown: /Auto-Shutdown\s*[:=]\s*true/i.test(log),
   };
 }
 async function fetchJobLog(run) {
@@ -300,7 +310,7 @@ function activeVMCard(run, info) {
     <div class="vm-head">
       <span class="badge in_progress">running</span>
       <div class="vm-title">Workstation #${run.run_number}
-        <span class="vm-sub mono">run ${run.id} · started ${ago(run.created_at)}${info && info.duration ? ` · session ${info.duration} min` : ""}${info && info.shutdown ? ` · shutdown at ${info.shutdown}` : ""}</span>
+        <span class="vm-sub mono">run ${run.id} · started ${ago(run.created_at)}${info && info.duration ? ` · session ${info.duration} min` : ""}${info && info.warning ? ` · warns at ${info.warning}` : ""}${info && info.autoShutdown ? ` · auto-shutdown on` : ""}</span>
       </div>
       <a href="${run.html_url}" target="_blank" rel="noopener">open ↗</a>
     </div>
@@ -318,6 +328,7 @@ function activeVMCard(run, info) {
             ${f("rdpUser", "Username", info.rdpUser)}
             ${f("rdpPass", "Password", info.rdpPass)}
             ${f("rdpPort", "Port", info.rdpPort)}
+            ${f("sessionId", "Session ID", info.sessionId)}
           </div>
           <div class="btn-row">
             <button class="btn primary sm" id="rdp-download">Download .rdp file</button>
