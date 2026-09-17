@@ -14,7 +14,7 @@
 ## Token scopes
 
 - **Classic PAT:** `repo` + `workflow`
-- **Fine-grained PAT:** on the `sovereign-workstation` repository — `Actions: Read & write`, `Codespaces: Read & write`, `Contents: Read-only`
+- **Fine-grained PAT:** on the `sovereign-workstation` repository — `Actions: Read & write`, `Contents: Read-only`; plus the account permission `Codespaces: Read & write`
 
 ## Notes
 
