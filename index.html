@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FUSE — Sovereign Workstation Dispatch Console</title>
+<meta name="description" content="FUSE — dispatch console for sovereign workstations">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='18' fill='%2300d4a0'/><text x='50' y='71' font-size='62' font-family='monospace' font-weight='bold' text-anchor='middle' fill='%23071016'>F</text></svg>">
+<link rel="stylesheet" href="fuse.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <div class="brand-mark">F</div>
+    <div>
+      <h1>FUSE</h1>
+      <p class="tagline">sovereign workstation dispatch console</p>
+    </div>
+  </div>
+  <div id="user-chip" class="user-chip hidden">
+    <img id="user-avatar" alt="" class="avatar">
+    <span id="user-login"></span>
+    <span id="api-dot" class="dot ok" title="API status"></span>
+    <button id="logout-btn" class="btn ghost sm">Logout</button>
+  </div>
+</header>
+
+<main>
+  <!-- LOGIN -->
+  <section id="login-view" class="card">
+    <h2>Login</h2>
+    <p>FUSE talks straight to the GitHub API from your browser. Paste a personal access token (PAT) — it is stored only in this browser's localStorage and sent only to api.github.com.</p>
+    <ul class="scopes">
+      <li><b>Classic PAT:</b> tick the <code>repo</code> and <code>workflow</code> scopes.</li>
+      <li><b>Fine-grained PAT:</b> grant <code>Actions: Read &amp; write</code>, <code>Codespaces: Read &amp; write</code>, <code>Contents: Read-only</code> on the <code>sovereign-workstation</code> repository.</li>
+    </ul>
+    <div class="row">
+      <input id="token-input" type="password" placeholder="ghp_… / github_pat_…" autocomplete="off" spellcheck="false">
+      <button id="token-visibility" class="btn ghost" type="button" title="Show / hide">👁</button>
+    </div>
+    <button id="login-btn" class="btn primary">Sign in</button>
+    <p id="login-error" class="error hidden"></p>
+    <p class="fineprint">Create a token at github.com/settings/tokens</p>
+  </section>
+
+  <!-- CONSOLE -->
+  <div id="console-view" class="hidden">
+    <section class="card">
+      <h2>Dispatch Sovereign Workstation</h2>
+      <form id="dispatch-form" class="grid">
+        <label>Session duration
+          <select id="duration">
+            <option value="60">60 min (1 h)</option>
+            <option value="95" selected>95 min (1 h 35 m)</option>
+            <option value="120">120 min (2 h)</option>
+            <option value="180">180 min (3 h)</option>
+            <option value="240">240 min (4 h)</option>
+            <option value="300">300 min (5 h)</option>
+          </select>
+        </label>
+        <label>Expiry warning
+          <select id="warning">
+            <option value="5">5 min before end</option>
+            <option value="10" selected>10 min before end</option>
+            <option value="15">15 min before end</option>
+            <option value="30">30 min before end</option>
+          </select>
+        </label>
+        <label>RDP username <input id="rdp-user" value="SovereignUser" spellcheck="false"></label>
+        <label>RDP password <input id="rdp-pass" value="PrivacyPlus2026!" spellcheck="false"></label>
+        <label>RDP port <input id="rdp-port" value="3389" inputmode="numeric"></label>
+        <label class="check"><input id="auto-shutdown" type="checkbox" checked> Auto-shutdown on expiry</label>
+        <label class="full">Tailscale auth key <span class="hint">(optional — blank uses the built-in TS_AUTHKEY repo secret)</span>
+          <input id="ts-key" type="password" placeholder="blank = built-in key" autocomplete="off" spellcheck="false">
+        </label>
+        <div class="full">
+          <button type="submit" class="btn primary" id="dispatch-btn">⚡ Ignite workstation</button>
+        </div>
+      </form>
+      <p id="dispatch-msg" class="hidden"></p>
+    </section>
+
+    <section class="card">
+      <h2>Codespace Exit Nodes</h2>
+      <p>Codespaces on <code>sovereign-workstation</code> come up automatically as dedicated <b>ephemeral Tailscale exit nodes</b> — no key pasting, no <code>tailscale up</code>.</p>
+      <button id="cs-create-btn" class="btn primary">▲ Create codespace exit node</button>
+      <p id="cs-msg" class="hidden"></p>
+      <div id="codespaces-list"></div>
+    </section>
+
+    <section class="card">
+      <h2>Workstation Runs <span class="refresh-note">auto-refresh 15 s</span></h2>
+      <div id="runs-list"><p class="muted">Loading…</p></div>
+    </section>
+  </div>
+</main>
+
+<footer>FUSE · dispatch console · your token never leaves this browser</footer>
+
+<!-- Connection info modal -->
+<div id="modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head"><h3>Connection info</h3><button id="modal-close" class="btn ghost sm">✕</button></div>
+    <div id="modal-body" class="mono"></div>
+  </div>
+</div>
+
+<script src="fuse.js"></script>
+</body>
+</html>
