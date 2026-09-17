@@ -9,7 +9,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="fuse.css?v=2">
+<link rel="stylesheet" href="fuse.css?v=3">
 </head>
 <body>
 
@@ -42,8 +42,8 @@
       </div>
     </div>
     <div class="lockcover" id="lock-dispatch" hidden>
-      <p>Sign in with a GitHub token to dispatch workstations.</p>
-      <button class="btn primary sm" data-open-login>Sign in with token</button>
+      <p>Sign in to dispatch workstations.</p>
+      <button class="btn primary sm" data-open-login>Sign in</button>
     </div>
     <form id="dispatch-form" class="grid">
       <label>Session duration
@@ -71,7 +71,7 @@
       <label class="full">Tailscale auth key <span class="hint">(optional — blank uses the built-in TS_AUTHKEY repo secret)</span>
         <input id="ts-key" type="password" placeholder="blank = built-in key" autocomplete="off" spellcheck="false">
       </label>
-      <div class="full">
+      <div class="full btn-row">
         <button type="submit" class="btn primary" id="dispatch-btn">Ignite workstation</button>
         <span id="dispatch-msg"></span>
       </div>
@@ -106,6 +106,20 @@
     </div>
   </section>
 
+  <!-- WORKSTATIONS (running + dead VMs, stats, RDP access) -->
+  <section class="card" id="ws-card">
+    <div class="card-head">
+      <div class="card-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+      </div>
+      <div>
+        <h2>Workstations</h2>
+        <p class="card-sub">Running VMs, stats and RDP access · auto-refreshes every 15 s · <span id="ws-updated"></span></p>
+      </div>
+    </div>
+    <div id="ws-body"></div>
+  </section>
+
   <!-- CODESPACES -->
   <section class="card" id="codespaces-card">
     <div class="card-head">
@@ -123,20 +137,6 @@
     <div id="cs-body"></div>
   </section>
 
-  <!-- RUNS -->
-  <section class="card" id="runs-card">
-    <div class="card-head">
-      <div class="card-icon">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 6h16M4 12h10M4 18h13"/></svg>
-      </div>
-      <div>
-        <h2>Workstation Runs</h2>
-        <p class="card-sub">Live status · auto-refreshes every 15 s</p>
-      </div>
-    </div>
-    <div id="runs-body"></div>
-  </section>
-
 </main>
 
 <footer>
@@ -148,26 +148,30 @@
 <div class="modal hidden" id="login-modal">
   <div class="modal-card">
     <div class="modal-head">
-      <h3>Sign in with GitHub token</h3>
+      <h3>Connect your GitHub account</h3>
       <button id="login-close" class="icon-btn" aria-label="Close">&#10005;</button>
     </div>
     <div class="modal-pad">
-      <p>Connect your GitHub account with a personal access token — FUSE signs you back in automatically on every visit. (GitHub doesn't allow full OAuth sign-in on static sites; a token is your account's credentials, stored only in this browser and sent only to <code>api.github.com</code>.)</p>
-      <div class="row">
-        <input id="login-input" type="password" placeholder="ghp_… / github_pat_…" autocomplete="off" spellcheck="false">
-        <button id="login-visibility" class="btn ghost" type="button" title="Show / hide">&#128065;</button>
+      <p>Sign in happens on github.com itself — FUSE never sees your password. Choose an account method:</p>
+      <button id="oauth-btn" class="btn primary full-btn gh-btn">
+        <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+        Continue with GitHub
+      </button>
+      <p id="oauth-note" class="fineprint hidden">GitHub account sign-in is being set up (one-time OAuth configuration). You can still use a token below.</p>
+
+      <div class="divider"><span>or</span></div>
+
+      <button id="token-toggle" class="btn ghost full-btn">Use a personal access token</button>
+      <div id="token-pane" class="hidden token-pane">
+        <div class="row">
+          <input id="login-input" type="password" placeholder="ghp_… / github_pat_…" autocomplete="off" spellcheck="false">
+          <button id="login-visibility" class="btn ghost" type="button" title="Show / hide">&#128065;</button>
+        </div>
+        <button id="login-submit" class="btn primary full-btn">Sign in with token</button>
+        <p class="fineprint">Stored only in this browser's localStorage · sent only to <code>api.github.com</code> ·
+          <a class="gen-link" href="https://github.com/settings/tokens/new?scopes=repo,workflow,user&description=FUSE%20console" target="_blank" rel="noopener">generate one with the right scopes ↗</a></p>
       </div>
-      <button id="login-submit" class="btn primary full-btn">Sign in</button>
       <p id="login-error" class="error hidden"></p>
-      <p class="fineprint">No token yet? <a class="gen-link" href="https://github.com/settings/tokens/new?scopes=repo,workflow,user&description=FUSE%20console" target="_blank" rel="noopener">Generate one with the right scopes pre-selected ↗</a></p>
-      <details class="scopes">
-        <summary>Which scopes does the token need?</summary>
-        <ul>
-          <li><b>Classic PAT:</b> <code>repo</code> + <code>workflow</code> (+ <code>user</code> for billing)</li>
-          <li><b>Fine-grained PAT:</b> on <code>sovereign-workstation</code> — <code>Actions: Read &amp; write</code>, <code>Contents: Read-only</code>; plus account permissions <code>Codespaces: Read &amp; write</code> and <code>Plans: Read</code> (billing)</li>
-        </ul>
-      </details>
-      <p class="fineprint">Create a token at github.com/settings/tokens</p>
     </div>
   </div>
 </div>
@@ -184,6 +188,6 @@
 </div>
 
 <div id="toasts" aria-live="polite"></div>
-<script src="fuse.js?v=2"></script>
+<script src="fuse.js?v=3"></script>
 </body>
 </html>

@@ -295,3 +295,41 @@ footer span { color: var(--accent); font-weight: 600; letter-spacing: 1.5px; }
 
 /* the hidden attribute must always win over display rules (lockcover, month-nav) */
 [hidden] { display: none !important; }
+
+/* ---------------- login modal: account + token ---------------- */
+.gh-btn { display: inline-flex; align-items: center; justify-content: center; gap: 9px; }
+.gh-btn svg { flex: 0 0 auto; }
+.divider { display: flex; align-items: center; gap: 12px; margin: 16px 0; color: var(--faint); font-size: 11px; letter-spacing: 2px; text-transform: uppercase; }
+.divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: var(--line-soft); }
+.token-pane { margin-top: 12px; display: flex; flex-direction: column; gap: 12px; }
+.btn-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+/* ---------------- workstations / VM card ---------------- */
+.vm-card { border: 1px solid rgba(46, 230, 168, .25); border-radius: 13px; padding: 16px 18px; background: rgba(10, 28, 24, .4); margin-bottom: 14px; }
+.vm-head { display: flex; align-items: center; gap: 13px; flex-wrap: wrap; margin-bottom: 12px; }
+.vm-title { flex: 1; min-width: 170px; font-weight: 600; font-size: 14px; min-width: 200px; }
+.vm-sub { display: block; color: var(--muted); font-size: 11px; font-weight: 400; margin-top: 2px; }
+.vm-head a { color: var(--accent); text-decoration: none; font-size: 12.5px; }
+.vm-head a:hover { text-decoration: underline; }
+.vm-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 9px; }
+.field { display: flex; align-items: center; gap: 10px; background: rgba(8, 19, 29, .6); border: 1px solid var(--line-soft); border-radius: 9px; padding: 8px 12px; }
+.f-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; flex: 0 0 auto; }
+.f-val { flex: 1; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.field .icon-btn { flex: 0 0 auto; }
+.rdp-block { margin-top: 13px; border-top: 1px dashed var(--line); padding-top: 13px; }
+.rdp-title { font-size: 11px; text-transform: uppercase; letter-spacing: 1.2px; color: var(--accent); font-weight: 700; margin-bottom: 9px; }
+.rdp-block .btn-row { margin-top: 12px; }
+.vm-idle { display: flex; gap: 14px; align-items: center; color: var(--muted); font-size: 13px; padding: 16px 4px; }
+.vm-idle svg { width: 26px; height: 26px; flex: 0 0 auto; color: var(--faint); }
+.vm-pending { display: flex; align-items: center; gap: 10px; padding: 4px 2px; }
+.spin { width: 14px; height: 14px; flex: 0 0 auto; border-radius: 50%; border: 2px solid var(--line); border-top-color: var(--accent); animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.sub-h { font-size: 11px; letter-spacing: 1.2px; text-transform: uppercase; color: var(--faint); margin: 18px 0 10px; font-weight: 700; }
+
+/* ---------------- button loading state ---------------- */
+.btn.loading { pointer-events: none; opacity: .75; position: relative; }
+.btn.loading::before {
+  content: ""; width: 13px; height: 13px; margin-right: 8px; flex: 0 0 auto;
+  border-radius: 50%; border: 2px solid rgba(0, 0, 0, .25); border-top-color: currentColor;
+  display: inline-block; vertical-align: -2px; animation: spin .8s linear infinite;
+}

@@ -1,7 +1,8 @@
 "use strict";
 /* FUSE — dispatch console for sovereign workstations.
-   Static page that talks straight to the GitHub REST API from the browser.
-   Sign-in is optional: the console renders as a guest until a PAT is added. */
+   Static page talking straight to the GitHub REST API from the browser.
+   Sign-in: GitHub account (OAuth via a tiny exchange helper) or a personal
+   access token (advanced, optional). Token lives only in localStorage. */
 
 const OWNER = "tariqchehardy";
 const REPO = "sovereign-workstation";
@@ -9,12 +10,16 @@ const WF = "provision-sovereign-workstation.yml";
 const API = "https://api.github.com";
 const KEY = "fuse_token";
 const LS_LIMITS = "fuse_limits";
+const OAUTH_EXCHANGE_URL = "https://untitled.base44.app/functions/githubOauthExchange";
 
 const $ = (id) => document.getElementById(id);
 let token = localStorage.getItem(KEY) || "";
 let me = null;
 let timer = null;
 let billMonth = null;
+let oauthCfg = null;
+let logCache = {};        // runId -> { ts, info, raw }
+let activeInfo = null;   // parsed info of the running VM
 
 /* ================= API ================= */
 async function api(path, opts = {}) {
@@ -53,20 +58,24 @@ function lockedHTML(what) {
   return `<div class="locked">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
       <rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
-    <p>Sign in with a GitHub token to ${what}.</p>
-    <button class="btn primary sm" data-open-login>Sign in with token</button>
+    <p>Sign in to ${what}.</p>
+    <button class="btn primary sm" data-open-login>Sign in</button>
   </div>`;
 }
 function bindLoginButtons(root) {
   root.querySelectorAll("[data-open-login]").forEach((b) => b.addEventListener("click", () => openLogin()));
 }
+function copyText(text, label) {
+  navigator.clipboard.writeText(text)
+    .then(() => toast(`${label} copied to clipboard.`))
+    .catch(() => toast("Clipboard blocked by the browser — copy manually.", "err"));
+}
 
 /* ================= auth ================= */
 function openLogin() {
   $("login-error").classList.add("hidden");
-  $("login-input").value = "";
   openModal("login-modal");
-  $("login-input").focus();
+  fetchOauthConfig();
 }
 async function doLogin() {
   const t = $("login-input").value.trim();
@@ -79,17 +88,14 @@ async function doLogin() {
     me = await api("/user");
     localStorage.setItem(KEY, t);
     closeModal("login-modal");
-    renderAuthArea();
-    renderLocks();
-    startPolling();
-    refreshAll();
+    finishSignIn();
     toast(`Signed in as ${me.login} — console unlocked.`);
   } catch (e) {
     token = save;
     $("login-error").textContent =
-      `Login failed (${e.status || "network"}): ${e.message}` +
+      `Token sign-in failed (${e.status || "network"}): ${e.message}` +
       (e.status === 401 ? " — token invalid or expired." :
-       e.status === 403 ? " — token lacks access. Check the scopes below." : "");
+       e.status === 403 ? " — token lacks access. Check the scopes." : "");
     $("login-error").classList.remove("hidden");
   } finally {
     $("login-submit").disabled = false;
@@ -97,11 +103,20 @@ async function doLogin() {
 }
 function logout() {
   localStorage.removeItem(KEY);
-  token = ""; me = null;
+  token = ""; me = null; activeInfo = null; logCache = {};
   clearInterval(timer); timer = null;
   renderAuthArea();
   renderLocks();
-  toast("Signed out. Token cleared from this browser.");
+  toast("Signed out. Credentials cleared from this browser.");
+}
+function finishSignIn() {
+  renderAuthArea();
+  renderLocks();
+  $("ws-body").innerHTML = skeletons(4);
+  $("cs-body").innerHTML = skeletons(2);
+  $("billing-body").innerHTML = skeletons(3);
+  refreshAll();
+  startPolling();
 }
 function renderAuthArea() {
   const a = $("auth-area");
@@ -124,7 +139,11 @@ function renderLocks() {
   $("lock-dispatch").hidden = authed;
   $("bill-nav").hidden = !authed;
   $("cs-create-btn").hidden = !authed;
-  const bodies = { "billing-body": "load billing and usage", "cs-body": "manage codespace exit nodes", "runs-body": "see workstation runs" };
+  const bodies = {
+    "billing-body": "load billing and usage",
+    "cs-body": "manage codespace exit nodes",
+    "ws-body": "see running workstations, stats and RDP access",
+  };
   for (const [id, what] of Object.entries(bodies)) {
     if (!authed) { $(id).innerHTML = lockedHTML(what); bindLoginButtons($(id)); }
   }
@@ -134,12 +153,74 @@ function startPolling() {
   timer = setInterval(refreshAll, 15000);
 }
 
+/* ================= GitHub account (OAuth) ================= */
+async function fetchOauthConfig() {
+  try {
+    const r = await fetch(OAUTH_EXCHANGE_URL, { headers: { Accept: "application/json" } });
+    oauthCfg = r.ok ? await r.json() : null;
+  } catch { oauthCfg = null; }
+  renderOAuthState();
+}
+function renderOAuthState() {
+  const ready = oauthCfg && oauthCfg.configured && oauthCfg.client_id;
+  $("oauth-btn").disabled = !ready;
+  $("oauth-note").classList.toggle("hidden", !!ready);
+  if (ready) $("oauth-note").textContent = "";
+}
+function startOAuth() {
+  if (!oauthCfg || !oauthCfg.configured) {
+    toast("GitHub account sign-in is still being configured — use a token for now.", "err");
+    return;
+  }
+  const state = crypto.randomUUID();
+  sessionStorage.setItem("fuse_oauth_state", state);
+  const p = new URLSearchParams({
+    client_id: oauthCfg.client_id,
+    redirect_uri: oauthCfg.redirect_uri || (location.origin + location.pathname),
+    scope: "repo workflow user codespace",
+    state,
+  });
+  location.href = `https://github.com/login/oauth/authorize?${p}`;
+}
+async function completeOAuth() {
+  const q = new URLSearchParams(location.search);
+  const code = q.get("code");
+  if (!code) return false;
+  const expected = sessionStorage.getItem("fuse_oauth_state");
+  sessionStorage.removeItem("fuse_oauth_state");
+  history.replaceState(null, "", location.pathname);
+  if (expected && q.get("state") !== expected) {
+    toast("Sign-in state mismatch — aborted for safety.", "err");
+    return false;
+  }
+  toast("Completing GitHub sign-in…");
+  try {
+    const r = await fetch(OAUTH_EXCHANGE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ code, redirect_uri: location.origin + location.pathname }),
+    });
+    const data = await r.json();
+    if (!r.ok || !data.access_token) throw new Error(data.message || data.error || `HTTP ${r.status}`);
+    token = data.access_token;
+    localStorage.setItem(KEY, token);
+    me = await api("/user");
+    finishSignIn();
+    toast(`Welcome back, ${me.login} — signed in with GitHub.`);
+    return true;
+  } catch (e) {
+    token = "";
+    toast(`GitHub sign-in failed: ${e.message}`, "err");
+    return false;
+  }
+}
+
 /* ================= dispatch ================= */
 async function dispatch(e) {
   e.preventDefault();
   if (!me) { openLogin(); return; }
   const btn = $("dispatch-btn");
-  btn.disabled = true;
+  btn.disabled = true; btn.classList.add("loading");
   const msg = $("dispatch-msg");
   msg.textContent = ""; msg.className = "";
   try {
@@ -158,23 +239,204 @@ async function dispatch(e) {
         },
       }),
     });
-    msg.textContent = "Dispatched — ignition. Status below in a moment.";
+    msg.textContent = "Dispatched — ignition.";
     msg.className = "ok";
-    toast("Workstation dispatched — ignition.");
+    toast("Workstation dispatched — ignition. Watch Workstations below.");
+    loadWorkstations();
   } catch (err) {
     msg.textContent = `Failed (${err.status}): ${err.message}`;
     msg.className = "err";
     toast(`Dispatch failed: ${err.message}`, "err");
   } finally {
-    btn.disabled = false;
-    loadRuns();
+    btn.disabled = false; btn.classList.remove("loading");
+  }
+}
+
+/* ================= workstations (running + dead VMs) ================= */
+const ago = (iso) => {
+  const s = Math.max(0, (Date.now() - new Date(iso)) / 1000);
+  if (s < 60) return `${Math.floor(s)}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  return `${Math.floor(s / 3600)} h ago`;
+};
+function parseConnInfo(log) {
+  const grab = (re) => { const m = log.match(re); return m ? m[1].trim() : null; };
+  return {
+    tsIp: grab(/Tailscale IP\s*[:=]\s*([0-9.]+)/),
+    tsHost: grab(/Tailscale Hostname\s*[:=]\s*(\S+)/),
+    tsDns: grab(/Tailscale DNS\s*[:=]\s*(\S+)/),
+    rdpUser: grab(/RDP Username\s*[:=]\s*(\S+)/i) || grab(/Username\s*[:=]\s*(\S+)/),
+    rdpPass: grab(/RDP Password\s*[:=]\s*(\S+)/i) || grab(/Password\s*[:=]\s*(\S+)/),
+    rdpPort: grab(/RDP Port\s*[:=]\s*(\d+)/) || grab(/Port\s*[:=]\s*(\d+)/),
+    shutdown: grab(/Shutdown scheduled for\s*(.+)/i),
+    duration: grab(/duration[^\d]*(\d+)\s*min/i),
+  };
+}
+async function fetchJobLog(run) {
+  const jobs = await api(`/repos/${OWNER}/${REPO}/actions/runs/${run.id}/jobs`);
+  const job = (jobs.jobs || []).find((j) => j.name.includes("Provision")) || (jobs.jobs || [])[0];
+  if (!job) throw new Error("no jobs found on this run");
+  const res = await fetch(`${API}/repos/${OWNER}/${REPO}/actions/jobs/${job.id}/logs`, {
+    headers: { Authorization: `Bearer ${token}`, "X-GitHub-Api-Version": "2022-11-28" },
+  });
+  return await res.text();
+}
+function activeVMCard(run, info) {
+  if (!run) {
+    return `<div class="vm-idle">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M9 12h6"/></svg>
+      <p>No workstation currently running — ignite one above, then connection info appears here automatically.</p>
+    </div>`;
+  }
+  const pending = !info || (!info.tsIp && !info.rdpUser);
+  const f = (id, label, val, cls = "") => val
+    ? `<div class="field ${cls}"><span class="f-label">${label}</span>
+         <span class="f-val mono" id="${id}-text">${val}</span>
+         <button class="icon-btn" data-copy="${id}" title="Copy">&#9114;</button></div>`
+    : "";
+  const rdpAddr = info && info.tsIp ? `${info.tsIp}:${info.rdpPort || "3389"}` : null;
+  return `
+  <div class="vm-card">
+    <div class="vm-head">
+      <span class="badge in_progress">running</span>
+      <div class="vm-title">Workstation #${run.run_number}
+        <span class="vm-sub mono">run ${run.id} · started ${ago(run.created_at)}${info && info.duration ? ` · session ${info.duration} min` : ""}${info && info.shutdown ? ` · shutdown at ${info.shutdown}` : ""}</span>
+      </div>
+      <a href="${run.html_url}" target="_blank" rel="noopener">open ↗</a>
+    </div>
+    ${pending
+      ? `<p class="muted vm-pending"><span class="spin"></span> Provisioning — Tailscale IP and RDP details appear here as soon as the workstation is up (this refreshes automatically).</p>`
+      : `<div class="vm-fields">
+          ${f("tsIp", "Tailscale IP", info.tsIp)}
+          ${f("tsHost", "Hostname", info.tsHost)}
+          ${f("tsDns", "Tailscale DNS", info.tsDns)}
+        </div>
+        <div class="rdp-block">
+          <div class="rdp-title">RDP access</div>
+          <div class="vm-fields">
+            ${f("rdpAddr", "Address", rdpAddr)}
+            ${f("rdpUser", "Username", info.rdpUser)}
+            ${f("rdpPass", "Password", info.rdpPass)}
+            ${f("rdpPort", "Port", info.rdpPort)}
+          </div>
+          <div class="btn-row">
+            <button class="btn primary sm" id="rdp-download">Download .rdp file</button>
+            <button class="btn ghost sm" data-run-info="${run.id}">Full connection info</button>
+          </div>
+          <p class="fineprint">Connect from any device on your tailnet — Windows Remote Desktop (mstsc), or an RDP client that accepts the .rdp file.</p>
+        </div>`}
+  </div>`;
+}
+function deadVMRow(run) {
+  const ok = run.conclusion === "success";
+  return `
+  <div class="run">
+    <span class="badge ${ok ? "success" : "failure"}">${ok ? "ended" : run.conclusion || "?"}</span>
+    <div class="meta">#${run.run_number} · ${ago(run.created_at)}
+      <div class="sub">run ${run.id} · dead VM — session closed</div>
+    </div>
+    <a href="${run.html_url}" target="_blank" rel="noopener">open ↗</a>
+  </div>`;
+}
+async function loadWorkstations() {
+  if (!me) return;
+  const wrap = $("ws-body");
+  try {
+    const data = await api(`/repos/${OWNER}/${REPO}/actions/workflows/${WF}/runs?per_page=8`);
+    const runs = data.workflow_runs || [];
+    const active = runs.filter((r) => r.status !== "completed");
+    const dead = runs.filter((r) => r.status === "completed");
+    let html = activeVMCard(active[0] || null, active[0] ? (logCache[active[0].id] || {}).info : null);
+    html += `<h3 class="sub-h">Past workstations</h3>`;
+    html += dead.length ? dead.map(deadVMRow).join("") : `<p class="muted">None yet.</p>`;
+    wrap.innerHTML = html;
+    $("ws-updated").textContent = `updated ${new Date().toLocaleTimeString()}`;
+    bindVmEvents(wrap);
+    if (active[0]) fetchActiveInfo(active[0]);
+  } catch (err) {
+    wrap.innerHTML = `<p class="error">Workstation status unavailable: ${err.message}</p>`;
+  }
+}
+async function fetchActiveInfo(run) {
+  const cached = logCache[run.id];
+  if (cached && Date.now() - cached.ts < 45000) return;
+  try {
+    const log = await fetchJobLog(run);
+    const info = parseConnInfo(log);
+    logCache[run.id] = { ts: Date.now(), info, raw: log };
+    activeInfo = info;
+    // re-render just the active card if fields changed
+    const wrap = $("ws-body");
+    const cur = wrap.querySelector(".vm-card");
+    if (cur && (cached ? JSON.stringify(cached.info) !== JSON.stringify(info) : true)) {
+      wrap.querySelector(".vm-card").outerHTML = activeVMCard(run, info);
+      bindVmEvents(wrap);
+    }
+  } catch (e) { /* transient — next poll retries */ }
+}
+function bindVmEvents(wrap) {
+  wrap.querySelectorAll("[data-copy]").forEach((b) => {
+    b.addEventListener("click", () => {
+      const id = b.dataset.copy;
+      const el = $(id + "-text");
+      if (el) copyText(el.textContent, b.closest(".field")?.querySelector(".f-label")?.textContent || "Value");
+    });
+  });
+  wrap.querySelectorAll("[data-run-info]").forEach((b) =>
+    b.addEventListener("click", () => showConnectionInfo(b.dataset.runInfo, b)));
+  const dl = $("rdp-download");
+  if (dl) dl.addEventListener("click", downloadRdp);
+}
+function downloadRdp() {
+  const info = activeInfo;
+  if (!info || !info.tsIp) { toast("No active workstation info yet.", "err"); return; }
+  const rdp = [
+    "screen mode id:i:2",
+    "use multimon:i:0",
+    `full address:s:${info.tsIp}:${info.rdpPort || "3389"}`,
+    `username:s:${info.rdpUser || "SovereignUser"}`,
+    `password 51:b:${btoa(info.rdpPass || "")}`,
+    "authentication level:i:2",
+    "desktopwidth:i:1920",
+    "desktopheight:i:1080",
+  ].join("\r\n");
+  const blob = new Blob([rdp], { type: "application/x-rdp" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "sovereign-workstation.rdp";
+  a.click();
+  URL.revokeObjectURL(a.href);
+  toast(".rdp file downloaded — open it with your RDP client.");
+}
+
+/* raw connection info modal */
+async function showConnectionInfo(runId, btn) {
+  if (btn) btn.disabled = true;
+  $("conn-body").textContent = "Fetching logs…";
+  openModal("conn-modal");
+  try {
+    const run = { id: runId };
+    let log = (logCache[runId] || {}).raw;
+    if (!log) {
+      log = await fetchJobLog(run);
+      logCache[runId] = { ts: Date.now(), info: parseConnInfo(log), raw: log };
+    }
+    const keep = log.split("\n").filter((l) =>
+      /tailscale\s+(ip|hostname|dns)|rdp|password|username|port|exit node|connection|ping|connect|shutdown|duration/i.test(l) && l.trim());
+    const out = [...new Set(keep.map((l) => l.replace(/^\S+\s+Z\s*/, "").trim()))].slice(0, 50).join("\n");
+    $("conn-body").textContent = out || "(no connection lines found in log — check the run on GitHub)";
+  } catch (err) {
+    $("conn-body").textContent = `Failed to load connection info (${err.status || ""}): ${err.message}\n\n` +
+      `Open the run on GitHub and read the "Display Connection Information" step:\nhttps://github.com/${OWNER}/${REPO}/actions/runs/${runId}`;
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 
 /* ================= codespaces ================= */
 async function createCodespace() {
   const btn = $("cs-create-btn");
-  btn.disabled = true;
+  btn.disabled = true; btn.classList.add("loading");
   try {
     const cs = await api(`/repos/${OWNER}/${REPO}/codespaces`, {
       method: "POST",
@@ -184,7 +446,7 @@ async function createCodespace() {
   } catch (err) {
     toast(`Codespace creation failed: ${err.message}`, "err");
   } finally {
-    btn.disabled = false;
+    btn.disabled = false; btn.classList.remove("loading");
     loadCodespaces();
   }
 }
@@ -214,77 +476,6 @@ async function loadCodespaces() {
       }));
   } catch (err) {
     wrap.innerHTML = `<p class="error">Codespaces unavailable: ${err.message}</p>`;
-  }
-}
-
-/* ================= runs ================= */
-const ago = (iso) => {
-  const s = Math.max(0, (Date.now() - new Date(iso)) / 1000);
-  if (s < 60) return `${Math.floor(s)}s ago`;
-  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
-  return `${Math.floor(s / 3600)} h ago`;
-};
-async function loadRuns() {
-  if (!me) return;
-  const wrap = $("runs-body");
-  try {
-    const data = await api(`/repos/${OWNER}/${REPO}/actions/workflows/${WF}/runs?per_page=6`);
-    const runs = data.workflow_runs || [];
-    if (!runs.length) { wrap.innerHTML = `<p class="muted" style="padding:10px 2px">No runs yet — ignite a workstation above.</p>`; return; }
-    wrap.innerHTML = runs.map((r) => {
-      const st = r.status === "completed" ? (r.conclusion || "?") : "running";
-      const cls = r.status === "completed"
-        ? (r.conclusion === "success" ? "success" : r.conclusion)
-        : r.status === "queued" || r.status === "waiting" ? "queued" : "in_progress";
-      return `
-      <div class="run">
-        <span class="badge ${cls}">${st}</span>
-        <div class="meta">Run #${r.run_number} · ${ago(r.created_at)}
-          <div class="sub">${r.id}${r.display_title ? " · " + r.display_title : ""}</div>
-        </div>
-        <button class="btn ghost sm" data-run-info="${r.id}">Connection info</button>
-        <a href="${r.html_url}" target="_blank" rel="noopener">open ↗</a>
-      </div>`;
-    }).join("");
-    wrap.querySelectorAll("[data-run-info]").forEach((b) =>
-      b.addEventListener("click", () => showConnectionInfo(b.dataset.runInfo, b)));
-  } catch (err) {
-    wrap.innerHTML = `<p class="error">Runs unavailable: ${err.message}</p>`;
-  }
-}
-
-/* connection info: pull the provision job's log */
-async function showConnectionInfo(runId, btn) {
-  btn.disabled = true;
-  $("conn-body").textContent = "Fetching logs…";
-  openModal("conn-modal");
-  try {
-    const jobs = await api(`/repos/${OWNER}/${REPO}/actions/runs/${runId}/jobs`);
-    const job = (jobs.jobs || []).find((j) => j.name.includes("Provision")) || (jobs.jobs || [])[0];
-    if (!job) throw new Error("no jobs found on this run");
-    let log = "";
-    try {
-      const res = await fetch(`${API}/repos/${OWNER}/${REPO}/actions/jobs/${job.id}/logs`, {
-        headers: { Authorization: `Bearer ${token}`, "X-GitHub-Api-Version": "2022-11-28" },
-      });
-      log = await res.text();
-    } catch (e) { log = ""; }
-    let out;
-    if (log) {
-      const keep = log.split("\n").filter((l) =>
-        /tailscale\s+(ip|hostname|dns)|rdp|password|username|port|exit node|connection|ping|connect/i.test(l) && l.trim());
-      out = [...new Set(keep.map((l) => l.replace(/^\S+\s+Z\s*/, "").trim()))].slice(0, 40).join("\n");
-      if (!out) out = "(no connection lines found in log — check the run on GitHub)";
-    } else {
-      out = `Log fetch blocked (CORS on the log redirect). Open the run on GitHub and read the
-"Display Connection Information" step:
-https://github.com/${OWNER}/${REPO}/actions/runs/${runId}`;
-    }
-    $("conn-body").textContent = out;
-  } catch (err) {
-    $("conn-body").textContent = `Failed to load connection info (${err.status || ""}): ${err.message}`;
-  } finally {
-    btn.disabled = false;
   }
 }
 
@@ -398,12 +589,19 @@ function toggleLimitsForm() {
 
 /* ================= refresh & init ================= */
 function refreshAll() {
-  if (!me) return;
-  loadRuns();
+  if (!me || document.hidden) return;
+  loadWorkstations();
   loadCodespaces();
   if (!billMonth) loadBilling();
 }
 
+/* wire up */
+$("oauth-btn").addEventListener("click", startOAuth);
+$("token-toggle").addEventListener("click", () => {
+  const p = $("token-pane");
+  p.classList.toggle("hidden");
+  if (!p.classList.contains("hidden")) $("login-input").focus();
+});
 $("login-submit").addEventListener("click", doLogin);
 $("login-input").addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
 $("login-visibility").addEventListener("click", () => {
@@ -414,6 +612,9 @@ $("login-close").addEventListener("click", () => closeModal("login-modal"));
 $("login-modal").addEventListener("click", (e) => { if (e.target === $("login-modal")) closeModal("login-modal"); });
 $("conn-close").addEventListener("click", () => closeModal("conn-modal"));
 $("conn-modal").addEventListener("click", (e) => { if (e.target === $("conn-modal")) closeModal("conn-modal"); });
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") { closeModal("login-modal"); closeModal("conn-modal"); }
+});
 $("dispatch-form").addEventListener("submit", dispatch);
 $("cs-create-btn").addEventListener("click", createCodespace);
 $("bill-prev").addEventListener("click", () => shiftMonth(-1));
@@ -429,26 +630,24 @@ $("limits-save").addEventListener("click", () => {
   loadBilling();
   toast("Limits saved.");
 });
+document.addEventListener("visibilitychange", () => { if (!document.hidden && me) refreshAll(); });
 
 (async function init() {
   renderAuthArea();
-  if (token) {
-    try {
-      me = await api("/user");
-      renderAuthArea();
+  const oauthDone = await completeOAuth();
+  if (!oauthDone) {
+    if (token) {
+      try {
+        me = await api("/user");
+        finishSignIn();
+      } catch (e) {
+        token = ""; me = null;
+        localStorage.removeItem(KEY);
+        renderLocks();
+        toast("Saved credentials no longer work — sign in again.", "err");
+      }
+    } else {
       renderLocks();
-      $("runs-body").innerHTML = skeletons(3);
-      $("cs-body").innerHTML = skeletons(2);
-      $("billing-body").innerHTML = skeletons(3);
-      refreshAll();
-      startPolling();
-    } catch (e) {
-      token = ""; me = null;
-      localStorage.removeItem(KEY);
-      renderLocks();
-      toast("Saved token no longer works — sign in again.", "err");
     }
-  } else {
-    renderLocks();
   }
 })();
