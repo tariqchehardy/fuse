@@ -25,7 +25,7 @@
 </header>
 
 <div class="guest-strip" id="guest-strip" hidden>
-  You're browsing as a guest — sign in with a GitHub token to load workstation data.
+  You're browsing as a guest — connect your GitHub account to load workstation data.
 </div>
 
 <main>
@@ -152,13 +152,14 @@
       <button id="login-close" class="icon-btn" aria-label="Close">&#10005;</button>
     </div>
     <div class="modal-pad">
-      <p>Sign-in is optional — FUSE works as a guest console until you add a token. It's stored only in this browser's localStorage and sent only to <code>api.github.com</code>.</p>
+      <p>Connect your GitHub account with a personal access token — FUSE signs you back in automatically on every visit. (GitHub doesn't allow full OAuth sign-in on static sites; a token is your account's credentials, stored only in this browser and sent only to <code>api.github.com</code>.)</p>
       <div class="row">
         <input id="login-input" type="password" placeholder="ghp_… / github_pat_…" autocomplete="off" spellcheck="false">
         <button id="login-visibility" class="btn ghost" type="button" title="Show / hide">&#128065;</button>
       </div>
       <button id="login-submit" class="btn primary full-btn">Sign in</button>
       <p id="login-error" class="error hidden"></p>
+      <p class="fineprint">No token yet? <a class="gen-link" href="https://github.com/settings/tokens/new?scopes=repo,workflow,user&description=FUSE%20console" target="_blank" rel="noopener">Generate one with the right scopes pre-selected ↗</a></p>
       <details class="scopes">
         <summary>Which scopes does the token need?</summary>
         <ul>

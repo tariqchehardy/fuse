@@ -289,3 +289,6 @@ footer span { color: var(--accent); font-weight: 600; letter-spacing: 1.5px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+.gen-link { color: var(--accent); text-decoration: none; }
+.gen-link:hover { text-decoration: underline; }

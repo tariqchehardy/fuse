@@ -114,7 +114,7 @@ function renderAuthArea() {
   } else {
     a.innerHTML = `
       <div class="status-pill"><span class="dot"></span> guest</div>
-      <button id="open-login" class="btn primary sm">Sign in with token</button>`;
+      <button id="open-login" class="btn primary sm">Sign in with GitHub</button>`;
     $("open-login").addEventListener("click", openLogin);
   }
 }
