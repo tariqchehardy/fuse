@@ -10,7 +10,7 @@
 - **Optional token sign-in** — a personal access token remains available as an advanced fallback (stored only in your browser's localStorage, sent only to `api.github.com`).
 - **Ignite a sovereign workstation** — dispatches the provisioning workflow with your chosen session duration, RDP credentials, and auto-shutdown. The Tailscale key is built in (`TS_AUTHKEY` repo secret); no pasting.
 - **Create a codespace exit node** — one button. Codespaces join the tailnet automatically as dedicated **ephemeral exit nodes**.
-- **Workstations dashboard** — the running VM gets a live status card: Tailscale IP / hostname / DNS, session duration, scheduled shutdown, and an RDP access block with copy buttons and a generated `.rdp` file download. Dead (ended) VMs are listed separately. Auto-refreshes every 15 s.
+- **Workstations dashboard** — the running VM gets a live status card: Tailscale IP / hostname / DNS, session duration, warning window, and an RDP access block with copy buttons and a generated `.rdp` file download. Connection info comes from the workflow's `connection-info` artifact (reliable while the VM is live; workflow v4.4.0+) with job-log parsing as fallback. Dead (ended) VMs are listed separately. Auto-refreshes every 15 s.
 - **Live status** — codespaces auto-refresh every 15 s.
 - **Billing & usage** — month-to-date Actions minutes, Codespaces core-hours and storage from the GitHub billing usage report, with limit progression bars (usage vs included quota and balance left), a daily usage graph, month navigation, and editable limits (auto-set from your plan; stored in localStorage).
 

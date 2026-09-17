@@ -368,22 +368,101 @@ async function loadWorkstations() {
     wrap.innerHTML = `<p class="error">Workstation status unavailable: ${err.message}</p>`;
   }
 }
+/* ---- connection info via the workflow's connection-info artifact ---- */
+function parseArtifactInfo(txt) {
+  const m = {};
+  txt.split(/\r?\n/).forEach((l) => {
+    const i = l.indexOf("=");
+    if (i > 0) m[l.slice(0, i).trim()] = l.slice(i + 1).trim();
+  });
+  const [ip, port] = (m.rdp_target || "").split(":");
+  return {
+    tsIp: m.tailscale_ip || ip || null,
+    tsHost: m.tailscale_hostname || null,
+    tsDns: m.tailscale_dns || null,
+    rdpUser: m.rdp_username || null,
+    rdpPass: m.rdp_password || null,
+    rdpPort: m.rdp_port || port || null,
+    duration: m.duration_minutes || null,
+    warning: m.warning_minutes ? `T-${m.warning_minutes} min` : null,
+    sessionId: m.session_id || null,
+    autoShutdown: (m.auto_shutdown || "").toLowerCase() === "true",
+  };
+}
+/* minimal zip reader (stored + deflate) for the single-file artifact */
+async function unzipFirstText(buf, needle) {
+  const u8 = new Uint8Array(buf), dv = new DataView(buf);
+  let eocd = -1;
+  for (let i = u8.length - 22; i >= Math.max(0, u8.length - 66000); i--) {
+    if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error("bad zip: no EOCD");
+  const count = dv.getUint16(eocd + 10, true);
+  let off = dv.getUint32(eocd + 16, true);
+  const td = new TextDecoder();
+  for (let n = 0; n < count; n++) {
+    if (dv.getUint32(off, true) !== 0x02014b50) throw new Error("bad central dir");
+    const method = dv.getUint16(off + 10, true);
+    const csize = dv.getUint32(off + 20, true);
+    const nameLen = dv.getUint16(off + 28, true);
+    const extraLen = dv.getUint16(off + 30, true);
+    const commentLen = dv.getUint16(off + 32, true);
+    const lho = dv.getUint32(off + 42, true);
+    const name = td.decode(u8.subarray(off + 46, off + 46 + nameLen));
+    off += 46 + nameLen + extraLen + commentLen;
+    if (needle && !name.toLowerCase().includes(needle)) continue;
+    const lNameLen = dv.getUint16(lho + 26, true);
+    const lExtraLen = dv.getUint16(lho + 28, true);
+    const dataStart = lho + 30 + lNameLen + lExtraLen;
+    const data = u8.subarray(dataStart, dataStart + csize);
+    if (method === 0) return td.decode(data);
+    if (method !== 8) throw new Error("unsupported zip method " + method);
+    const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+    return await new Response(stream).text();
+  }
+  throw new Error("entry not found in zip");
+}
+async function fetchArtifactInfo(run) {
+  const arts = await api(`/repos/${OWNER}/${REPO}/actions/artifacts?per_page=20`);
+  const art = (arts.artifacts || []).find(
+    (a) => a.workflow_run && a.workflow_run.id === run.id && a.name === "connection-info" && !a.expired);
+  if (!art) return null;
+  const res = await fetch(`${API}/repos/${OWNER}/${REPO}/actions/artifacts/${art.id}/zip`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
+  });
+  if (!res.ok) throw new Error(`artifact zip HTTP ${res.status}`);
+  const txt = await unzipFirstText(await res.arrayBuffer(), "connection-info");
+  return { info: parseArtifactInfo(txt), raw: txt };
+}
+
 async function fetchActiveInfo(run) {
   const cached = logCache[run.id];
   if (cached && Date.now() - cached.ts < 45000) return;
+  // Prefer the workflow's connection-info artifact — in-progress job logs
+  // are only intermittently fetchable via the API. Logs stay the fallback
+  // (and the only source for old runs pre-v4.4.0).
+  let info = null, raw = null;
   try {
-    const log = await fetchJobLog(run);
-    const info = parseConnInfo(log);
-    logCache[run.id] = { ts: Date.now(), info, raw: log };
-    activeInfo = info;
-    // re-render just the active card if fields changed
-    const wrap = $("ws-body");
-    const cur = wrap.querySelector(".vm-card");
-    if (cur && (cached ? JSON.stringify(cached.info) !== JSON.stringify(info) : true)) {
-      wrap.querySelector(".vm-card").outerHTML = activeVMCard(run, info);
-      bindVmEvents(wrap);
-    }
-  } catch (e) { /* transient — next poll retries */ }
+    const a = await fetchArtifactInfo(run);
+    if (a) { info = a.info; raw = a.raw; }
+  } catch (e) { /* artifact missing or fetch hiccup — try logs */ }
+  if (!info) {
+    try {
+      const log = await fetchJobLog(run);
+      info = parseConnInfo(log);
+      raw = log;
+    } catch (e) { /* neither available yet — next poll retries */ }
+  }
+  if (!info) return;
+  logCache[run.id] = { ts: Date.now(), info, raw };
+  activeInfo = info;
+  // re-render just the active card if fields changed
+  const wrap = $("ws-body");
+  const cur = wrap.querySelector(".vm-card");
+  if (cur && (cached ? JSON.stringify(cached.info) !== JSON.stringify(info) : true)) {
+    wrap.querySelector(".vm-card").outerHTML = activeVMCard(run, info);
+    bindVmEvents(wrap);
+  }
 }
 function bindVmEvents(wrap) {
   wrap.querySelectorAll("[data-copy]").forEach((b) => {
@@ -431,6 +510,11 @@ async function showConnectionInfo(runId, btn) {
     if (!log) {
       log = await fetchJobLog(run);
       logCache[runId] = { ts: Date.now(), info: parseConnInfo(log), raw: log };
+    }
+    if (/^session_id=/m.test(log)) {
+      // artifact text — clean key=value lines, render as-is
+      $("conn-body").textContent = log.trim();
+      return;
     }
     const keep = log.split("\n").filter((l) =>
       /tailscale\s+(ip|hostname|dns)|rdp|password|username|port|exit node|connection|ping|connect|shutdown|duration/i.test(l) && l.trim());
