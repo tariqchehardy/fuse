@@ -1,14 +1,16 @@
 "use strict";
 /* FUSE — dispatch console for sovereign workstations.
    Static page talking straight to the GitHub REST API from the browser.
-   Sign-in: GitHub account (OAuth via a tiny exchange helper) or a personal
-   access token (advanced, optional). Token lives only in localStorage. */
+   Sign-in: GitHub account (GitHub App user-to-server flow via a tiny
+   exchange helper — tokens expire in 8h and auto-refresh) or a personal
+   access token (advanced, optional). Tokens live only in localStorage. */
 
 const OWNER = "tariqchehardy";
 const REPO = "sovereign-workstation";
 const WF = "provision-sovereign-workstation.yml";
 const API = "https://api.github.com";
 const KEY = "fuse_token";
+const RKEY = "fuse_refresh";   // GitHub App refresh token (rotated on every refresh)
 const LS_LIMITS = "fuse_limits";
 const OAUTH_EXCHANGE_URL = "https://untitled.base44.app/functions/githubOauthExchange";
 
@@ -22,7 +24,26 @@ let logCache = {};        // runId -> { ts, info, raw }
 let activeInfo = null;   // parsed info of the running VM
 
 /* ================= API ================= */
-async function api(path, opts = {}) {
+async function refreshOAuthToken() {
+  const rt = localStorage.getItem(RKEY);
+  if (!rt) return false;
+  try {
+    const r = await fetch(OAUTH_EXCHANGE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ grant_type: "refresh_token", refresh_token: rt }),
+    });
+    if (!r.ok) return false;
+    const d = await r.json().catch(() => null);
+    if (!d || !d.access_token) return false;
+    token = d.access_token;
+    localStorage.setItem(KEY, token);
+    if (d.refresh_token) localStorage.setItem(RKEY, d.refresh_token); // rotation
+    return true;
+  } catch { return false; }
+}
+
+async function api(path, opts = {}, retry = true) {
   const res = await fetch(`${API}${path}`, {
     ...opts,
     headers: {
@@ -33,6 +54,10 @@ async function api(path, opts = {}) {
       ...(opts.headers || {}),
     },
   });
+  // GitHub App user tokens expire after 8h — refresh once and retry
+  if (res.status === 401 && retry && localStorage.getItem(RKEY)) {
+    if (await refreshOAuthToken()) return api(path, opts, false);
+  }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     const err = new Error(body.message || res.statusText);
@@ -103,6 +128,7 @@ async function doLogin() {
 }
 function logout() {
   localStorage.removeItem(KEY);
+  localStorage.removeItem(RKEY);
   token = ""; me = null; activeInfo = null; logCache = {};
   clearInterval(timer); timer = null;
   renderAuthArea();
@@ -174,10 +200,11 @@ function startOAuth() {
   }
   const state = crypto.randomUUID();
   sessionStorage.setItem("fuse_oauth_state", state);
+  // GitHub App flow: permissions are configured on the app itself,
+  // so no scope parameter is sent.
   const p = new URLSearchParams({
     client_id: oauthCfg.client_id,
     redirect_uri: oauthCfg.redirect_uri || (location.origin + location.pathname),
-    scope: "repo workflow user codespace",
     state,
   });
   location.href = `https://github.com/login/oauth/authorize?${p}`;
@@ -204,6 +231,7 @@ async function completeOAuth() {
     if (!r.ok || !data.access_token) throw new Error(data.message || data.error || `HTTP ${r.status}`);
     token = data.access_token;
     localStorage.setItem(KEY, token);
+    if (data.refresh_token) localStorage.setItem(RKEY, data.refresh_token);
     me = await api("/user");
     finishSignIn();
     toast(`Welcome back, ${me.login} — signed in with GitHub.`);
@@ -615,7 +643,7 @@ async function loadBilling() {
     renderBilling({ actionsMin, csCoreHrs, csGbHrs, gross, discount, net, perDay, y, m });
   } catch (err) {
     body.innerHTML = `<p class="error">Billing unavailable (${err.status || "network"}): ${err.message}.</p>
-      <p class="muted">The token may lack billing read access — fine-grained PAT: account permission <code>Plans: Read</code>; classic PAT: <code>user</code> scope.</p>`;
+      <p class="muted">Billing endpoints need a personal access token — fine-grained PAT: account permission <code>Plans: Read</code>; classic PAT: <code>user</code> scope. GitHub App sign-in tokens cannot read billing.</p>`;
   }
 }
 function metricBar(label, used, limit, unit, decimals = 0) {
