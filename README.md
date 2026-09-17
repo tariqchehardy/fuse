@@ -6,7 +6,7 @@
 
 ## What it does
 
-- **Login / logout** with a GitHub personal access token (stored only in your browser's localStorage, sent only to `api.github.com`).
+- **Optional sign-in** — the console renders as a guest; sign in with a GitHub personal access token to unlock workstation data (stored only in your browser's localStorage, sent only to `api.github.com`).
 - **Ignite a sovereign workstation** — dispatches the provisioning workflow with your chosen session duration, RDP credentials, and auto-shutdown. The Tailscale key is built in (`TS_AUTHKEY` repo secret); no pasting.
 - **Create a codespace exit node** — one button. Codespaces join the tailnet automatically as dedicated **ephemeral exit nodes**.
 - **Live status** — workstation runs and codespaces auto-refresh every 15 s; pull the connection info (Tailscale IP/hostname, RDP details) out of the run log.

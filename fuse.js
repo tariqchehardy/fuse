@@ -1,92 +1,147 @@
 "use strict";
 /* FUSE — dispatch console for sovereign workstations.
-   Talks directly to the GitHub REST API from the browser.
-   The PAT lives only in localStorage and is sent only to api.github.com. */
+   Static page that talks straight to the GitHub REST API from the browser.
+   Sign-in is optional: the console renders as a guest until a PAT is added. */
 
 const OWNER = "tariqchehardy";
 const REPO = "sovereign-workstation";
 const WF = "provision-sovereign-workstation.yml";
 const API = "https://api.github.com";
 const KEY = "fuse_token";
+const LS_LIMITS = "fuse_limits";
 
 const $ = (id) => document.getElementById(id);
 let token = localStorage.getItem(KEY) || "";
-let timer = null;
 let me = null;
+let timer = null;
+let billMonth = null;
 
-/* ---------------- API helper ---------------- */
+/* ================= API ================= */
 async function api(path, opts = {}) {
   const res = await fetch(`${API}${path}`, {
     ...opts,
     headers: {
-      Authorization: `Bearer ${token}`,
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       Accept: "application/vnd.github+json",
       "X-GitHub-Api-Version": "2022-11-28",
       ...(opts.body ? { "Content-Type": "application/json" } : {}),
       ...(opts.headers || {}),
     },
   });
-  setDot(true);
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     const err = new Error(body.message || res.statusText);
     err.status = res.status;
     throw err;
   }
-  if (res.status === 204) return null;
-  return res.json();
+  return res.status === 204 ? null : res.json();
 }
-function setDot(ok) { $("api-dot").className = `dot ${ok ? "ok" : "bad"}`; }
 
-/* ---------------- auth ---------------- */
-async function login() {
-  const t = $("token-input").value.trim();
+/* ================= UI helpers ================= */
+function toast(msg, type = "ok") {
+  const t = document.createElement("div");
+  t.className = `toast ${type}`;
+  t.textContent = msg;
+  $("toasts").appendChild(t);
+  requestAnimationFrame(() => t.classList.add("show"));
+  setTimeout(() => { t.classList.remove("show"); setTimeout(() => t.remove(), 320); }, 4200);
+}
+const openModal = (id) => $(id).classList.remove("hidden");
+const closeModal = (id) => $(id).classList.add("hidden");
+function skeletons(n) { return Array.from({ length: n }, () => `<div class="skeleton"></div>`).join(""); }
+function lockedHTML(what) {
+  return `<div class="locked">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+    <p>Sign in with a GitHub token to ${what}.</p>
+    <button class="btn primary sm" data-open-login>Sign in with token</button>
+  </div>`;
+}
+function bindLoginButtons(root) {
+  root.querySelectorAll("[data-open-login]").forEach((b) => b.addEventListener("click", () => openLogin()));
+}
+
+/* ================= auth ================= */
+function openLogin() {
+  $("login-error").classList.add("hidden");
+  $("login-input").value = "";
+  openModal("login-modal");
+  $("login-input").focus();
+}
+async function doLogin() {
+  const t = $("login-input").value.trim();
   if (!t) return;
-  $("login-btn").disabled = true;
+  $("login-submit").disabled = true;
   $("login-error").classList.add("hidden");
   try {
+    const save = token;
     token = t;
     me = await api("/user");
     localStorage.setItem(KEY, t);
-    $("user-avatar").src = me.avatar_url;
-    $("user-login").textContent = me.login;
-    boot();
+    closeModal("login-modal");
+    renderAuthArea();
+    renderLocks();
+    startPolling();
+    refreshAll();
+    toast(`Signed in as ${me.login} — console unlocked.`);
   } catch (e) {
-    token = "";
+    token = save;
     $("login-error").textContent =
       `Login failed (${e.status || "network"}): ${e.message}` +
       (e.status === 401 ? " — token invalid or expired." :
-       e.status === 403 ? " — token lacks access. Classic PAT: repo+workflow scopes." : "");
+       e.status === 403 ? " — token lacks access. Check the scopes below." : "");
     $("login-error").classList.remove("hidden");
   } finally {
-    $("login-btn").disabled = false;
+    $("login-submit").disabled = false;
   }
 }
 function logout() {
   localStorage.removeItem(KEY);
-  token = "";
-  clearInterval(timer);
-  $("login-view").classList.remove("hidden");
-  $("console-view").classList.add("hidden");
-  $("user-chip").classList.add("hidden");
-  $("token-input").value = "";
+  token = ""; me = null;
+  clearInterval(timer); timer = null;
+  renderAuthArea();
+  renderLocks();
+  toast("Signed out. Token cleared from this browser.");
 }
-function boot() {
-  $("login-view").classList.add("hidden");
-  $("console-view").classList.remove("hidden");
-  $("user-chip").classList.remove("hidden");
-  refreshAll();
+function renderAuthArea() {
+  const a = $("auth-area");
+  if (me) {
+    a.innerHTML = `
+      <div class="status-pill" title="sovereign-workstation · private repo"><span class="dot ok"></span> connected · <b>${me.login}</b></div>
+      <img class="avatar" src="${me.avatar_url}" alt="" title="${me.login}">
+      <button id="logout-btn" class="btn ghost sm">Sign out</button>`;
+    $("logout-btn").addEventListener("click", logout);
+  } else {
+    a.innerHTML = `
+      <div class="status-pill"><span class="dot"></span> guest</div>
+      <button id="open-login" class="btn primary sm">Sign in with token</button>`;
+    $("open-login").addEventListener("click", openLogin);
+  }
+}
+function renderLocks() {
+  const authed = !!me;
+  $("guest-strip").hidden = authed;
+  $("lock-dispatch").hidden = authed;
+  $("bill-nav").hidden = !authed;
+  $("cs-create-btn").hidden = !authed;
+  const bodies = { "billing-body": "load billing and usage", "cs-body": "manage codespace exit nodes", "runs-body": "see workstation runs" };
+  for (const [id, what] of Object.entries(bodies)) {
+    if (!authed) { $(id).innerHTML = lockedHTML(what); bindLoginButtons($(id)); }
+  }
+}
+function startPolling() {
   clearInterval(timer);
   timer = setInterval(refreshAll, 15000);
 }
 
-/* ---------------- dispatch workstation ---------------- */
+/* ================= dispatch ================= */
 async function dispatch(e) {
   e.preventDefault();
+  if (!me) { openLogin(); return; }
   const btn = $("dispatch-btn");
   btn.disabled = true;
   const msg = $("dispatch-msg");
-  msg.classList.add("hidden");
+  msg.textContent = ""; msg.className = "";
   try {
     await api(`/repos/${OWNER}/${REPO}/actions/workflows/${WF}/dispatches`, {
       method: "POST",
@@ -103,44 +158,43 @@ async function dispatch(e) {
         },
       }),
     });
-    msg.textContent = "⚡ Workstation dispatched — ignition. Status appears below in a moment.";
-    msg.className = "muted";
+    msg.textContent = "Dispatched — ignition. Status below in a moment.";
+    msg.className = "ok";
+    toast("Workstation dispatched — ignition.");
   } catch (err) {
-    msg.textContent = `Dispatch failed (${err.status}): ${err.message}`;
-    msg.className = "error";
+    msg.textContent = `Failed (${err.status}): ${err.message}`;
+    msg.className = "err";
+    toast(`Dispatch failed: ${err.message}`, "err");
   } finally {
-    msg.classList.remove("hidden");
     btn.disabled = false;
+    loadRuns();
   }
 }
 
-/* ---------------- codespaces ---------------- */
+/* ================= codespaces ================= */
 async function createCodespace() {
   const btn = $("cs-create-btn");
-  const msg = $("cs-msg");
   btn.disabled = true;
   try {
     const cs = await api(`/repos/${OWNER}/${REPO}/codespaces`, {
       method: "POST",
       body: JSON.stringify({ ref: "main" }),
     });
-    msg.textContent = `▲ Codespace "${cs.name}" is provisioning — it will join the tailnet as an ephemeral exit node automatically.`;
-    msg.className = "muted";
+    toast(`Codespace "${cs.name}" provisioning — joins the tailnet as an ephemeral exit node.`);
   } catch (err) {
-    msg.textContent = `Codespace creation failed (${err.status}): ${err.message}`;
-    msg.className = "error";
+    toast(`Codespace creation failed: ${err.message}`, "err");
   } finally {
-    msg.classList.remove("hidden");
     btn.disabled = false;
     loadCodespaces();
   }
 }
 async function loadCodespaces() {
-  const wrap = $("codespaces-list");
+  if (!me) return;
+  const wrap = $("cs-body");
   try {
     const data = await api(`/repos/${OWNER}/${REPO}/codespaces?per_page=10`);
     const list = data.codespaces || [];
-    if (!list.length) { wrap.innerHTML = `<p class="muted">No codespaces running.</p>`; return; }
+    if (!list.length) { wrap.innerHTML = `<p class="muted" style="padding:10px 2px">No codespaces running.</p>`; return; }
     wrap.innerHTML = list.map((c) => `
       <div class="run">
         <span class="badge ${c.state === "Available" ? "success" : "in_progress"}">${c.state}</span>
@@ -152,114 +206,108 @@ async function loadCodespaces() {
     wrap.querySelectorAll("[data-cs-del]").forEach((b) =>
       b.addEventListener("click", async () => {
         b.disabled = true;
-        try { await api(`/user/codespaces/${b.dataset.csDel}`, { method: "DELETE" }); }
-        catch (err) { alert(`Delete failed: ${err.message}`); }
+        try {
+          await api(`/user/codespaces/${b.dataset.csDel}`, { method: "DELETE" });
+          toast("Codespace deleted — node removed from the tailnet.");
+        } catch (err) { toast(`Delete failed: ${err.message}`, "err"); }
         loadCodespaces();
       }));
   } catch (err) {
-    wrap.innerHTML = `<p class="error">Codespaces list failed: ${err.message}</p>`;
+    wrap.innerHTML = `<p class="error">Codespaces unavailable: ${err.message}</p>`;
   }
 }
 
-/* ---------------- runs ---------------- */
-const STATUS_LABEL = { success: "success", failure: "failed", in_progress: "running", queued: "queued", waiting: "queued", cancelled: "cancelled" };
-function ago(iso) {
+/* ================= runs ================= */
+const ago = (iso) => {
   const s = Math.max(0, (Date.now() - new Date(iso)) / 1000);
   if (s < 60) return `${Math.floor(s)}s ago`;
   if (s < 3600) return `${Math.floor(s / 60)} min ago`;
   return `${Math.floor(s / 3600)} h ago`;
-}
+};
 async function loadRuns() {
-  const wrap = $("runs-list");
+  if (!me) return;
+  const wrap = $("runs-body");
   try {
     const data = await api(`/repos/${OWNER}/${REPO}/actions/workflows/${WF}/runs?per_page=6`);
     const runs = data.workflow_runs || [];
-    if (!runs.length) { wrap.innerHTML = `<p class="muted">No runs yet.</p>`; return; }
-    wrap.innerHTML = runs.map((r) => `
+    if (!runs.length) { wrap.innerHTML = `<p class="muted" style="padding:10px 2px">No runs yet — ignite a workstation above.</p>`; return; }
+    wrap.innerHTML = runs.map((r) => {
+      const st = r.status === "completed" ? (r.conclusion || "?") : "running";
+      const cls = r.status === "completed"
+        ? (r.conclusion === "success" ? "success" : r.conclusion)
+        : r.status === "queued" || r.status === "waiting" ? "queued" : "in_progress";
+      return `
       <div class="run">
-        <span class="badge ${STATUS_LABEL[r.status === "completed" ? r.conclusion : r.status] || "queued"}">
-          ${r.status === "completed" ? (r.conclusion || "?") : "running"}</span>
-        <div class="meta">#${r.run_number} · dispatched ${ago(r.created_at)}
-          <div class="sub">run ${r.id}</div>
+        <span class="badge ${cls}">${st}</span>
+        <div class="meta">Run #${r.run_number} · ${ago(r.created_at)}
+          <div class="sub">${r.id}${r.display_title ? " · " + r.display_title : ""}</div>
         </div>
         <button class="btn ghost sm" data-run-info="${r.id}">Connection info</button>
         <a href="${r.html_url}" target="_blank" rel="noopener">open ↗</a>
-      </div>`).join("");
+      </div>`;
+    }).join("");
     wrap.querySelectorAll("[data-run-info]").forEach((b) =>
       b.addEventListener("click", () => showConnectionInfo(b.dataset.runInfo, b)));
   } catch (err) {
-    wrap.innerHTML = `<p class="error">Runs list failed: ${err.message}</p>`;
+    wrap.innerHTML = `<p class="error">Runs unavailable: ${err.message}</p>`;
   }
 }
 
-/* pull the provision job's log and surface connection details */
+/* connection info: pull the provision job's log */
 async function showConnectionInfo(runId, btn) {
   btn.disabled = true;
-  $("modal-body").textContent = "Fetching logs…";
-  $("modal").classList.remove("hidden");
+  $("conn-body").textContent = "Fetching logs…";
+  openModal("conn-modal");
   try {
     const jobs = await api(`/repos/${OWNER}/${REPO}/actions/runs/${runId}/jobs`);
     const job = (jobs.jobs || []).find((j) => j.name.includes("Provision")) || (jobs.jobs || [])[0];
     if (!job) throw new Error("no jobs found on this run");
-
     let log = "";
     try {
       const res = await fetch(`${API}/repos/${OWNER}/${REPO}/actions/jobs/${job.id}/logs`, {
         headers: { Authorization: `Bearer ${token}`, "X-GitHub-Api-Version": "2022-11-28" },
       });
       log = await res.text();
-    } catch (e) {
-      log = "";
-    }
-
-    let out = "";
+    } catch (e) { log = ""; }
+    let out;
     if (log) {
       const keep = log.split("\n").filter((l) =>
         /tailscale\s+(ip|hostname|dns)|rdp|password|username|port|exit node|connection|ping|connect/i.test(l) && l.trim());
-      const dedup = [...new Set(keep.map((l) => l.replace(/^\S+\s+Z\s*/, "").trim()))];
-      out = dedup.slice(0, 40).join("\n");
+      out = [...new Set(keep.map((l) => l.replace(/^\S+\s+Z\s*/, "").trim()))].slice(0, 40).join("\n");
       if (!out) out = "(no connection lines found in log — check the run on GitHub)";
     } else {
       out = `Log fetch blocked (CORS on the log redirect). Open the run on GitHub and read the
-"Display Connection Information" step:\nhttps://github.com/${OWNER}/${REPO}/actions/runs/${runId}`;
+"Display Connection Information" step:
+https://github.com/${OWNER}/${REPO}/actions/runs/${runId}`;
     }
-    $("modal-body").textContent = out;
+    $("conn-body").textContent = out;
   } catch (err) {
-    $("modal-body").textContent = `Failed to load connection info (${err.status || ""}): ${err.message}`;
+    $("conn-body").textContent = `Failed to load connection info (${err.status || ""}): ${err.message}`;
   } finally {
     btn.disabled = false;
   }
 }
 
-function refreshAll() { loadRuns(); loadCodespaces(); if (!billMonth) loadBilling(); }
-
-
-/* ---------------- billing & usage ---------------- */
-const LS_LIMITS = "fuse_limits";
-let billMonth = null; // {y, m} while navigating
+/* ================= billing ================= */
 function nowYM() { const d = new Date(); return { y: d.getUTCFullYear(), m: d.getUTCMonth() + 1 }; }
-function loadLimits() {
-  try { return JSON.parse(localStorage.getItem(LS_LIMITS)) || null; } catch { return null; }
-}
+function loadLimits() { try { return JSON.parse(localStorage.getItem(LS_LIMITS)) || null; } catch { return null; } }
 function defaultLimits() {
   const pro = me && me.plan && /pro/i.test(me.plan.name || "");
   return { actionsMinutes: pro ? 3000 : 2000, codespacesCoreHours: 120, codespacesStorageGbMonth: 15 };
 }
-function getLimits() { return Object.assign(defaultLimits(), loadLimits() || {}); }
-
-function coresFromSku(sku) { const m = /(\d+)-core/i.exec(sku || ""); return m ? +m[1] : 1; }
+const getLimits = () => Object.assign(defaultLimits(), loadLimits() || {});
+const coresFromSku = (sku) => { const m = /(\d+)-core/i.exec(sku || ""); return m ? +m[1] : 1; };
 const usd = (n) => "$" + (n || 0).toFixed(2);
 
 async function loadBilling() {
+  if (!me) return;
   const body = $("billing-body");
   const { y, m } = billMonth || nowYM();
-  const lbl = new Date(Date.UTC(y, m - 1, 1)).toLocaleDateString(undefined, { month: "long", year: "numeric", timeZone: "UTC" });
-  $("bill-month-label").textContent = lbl;
+  $("bill-month-label").textContent =
+    new Date(Date.UTC(y, m - 1, 1)).toLocaleDateString(undefined, { month: "long", year: "numeric", timeZone: "UTC" });
   try {
     const data = await api(`/users/${me.login}/settings/billing/usage?year=${y}&month=${m}`);
     const items = data.usageItems || [];
-
-    // aggregate
     let actionsMin = 0, csCoreHrs = 0, csGbHrs = 0, gross = 0, discount = 0, net = 0;
     const perDay = {};
     for (const it of items) {
@@ -281,36 +329,30 @@ async function loadBilling() {
     renderBilling({ actionsMin, csCoreHrs, csGbHrs, gross, discount, net, perDay, y, m });
   } catch (err) {
     body.innerHTML = `<p class="error">Billing unavailable (${err.status || "network"}): ${err.message}.</p>
-      <p class="muted">The token may lack billing read access — for a fine-grained PAT add the account permission <code>Plans: Read</code>; for a classic PAT include the <code>user</code> scope.</p>`;
+      <p class="muted">The token may lack billing read access — fine-grained PAT: account permission <code>Plans: Read</code>; classic PAT: <code>user</code> scope.</p>`;
   }
 }
-
 function metricBar(label, used, limit, unit, decimals = 0) {
   const pct = limit > 0 ? (used / limit) * 100 : 100;
   const cls = pct > 100 ? "over" : pct > 85 ? "warn" : "";
   const left = Math.max(0, limit - used);
   return `<div class="metric">
     <div class="m-top"><span>${label}</span>
-      <span>${used.toFixed(decimals)} / ${limit.toLocaleString()} ${unit} used · <span class="m-left">left: ${left.toFixed(decimals)} ${unit}</span></span>
+      <span>${used.toFixed(decimals)} / ${limit.toLocaleString()} ${unit} · <span class="m-left">left: ${left.toFixed(decimals)}</span></span>
     </div>
     <div class="bar-track"><div class="bar-fill ${cls}" style="width:${Math.min(100, pct)}%"></div></div>
   </div>`;
 }
-
 function renderBilling(t) {
   const lim = getLimits();
-  const csGbMonth = t.csGbHrs / 730; // GB-hours -> GB-month
-  const body = $("billing-body");
-
-  // tiles
+  const csGbMonth = t.csGbHrs / 730;
   const tiles = `
     <div class="tile"><div class="t-label">Actions minutes</div><div class="t-value">${Math.round(t.actionsMin).toLocaleString()}</div><div class="t-sub">of ${lim.actionsMinutes.toLocaleString()} included</div></div>
     <div class="tile"><div class="t-label">Codespaces core-h</div><div class="t-value">${Math.round(t.csCoreHrs).toLocaleString()}</div><div class="t-sub">of ${lim.codespacesCoreHours.toLocaleString()} included</div></div>
     <div class="tile"><div class="t-label">Codespaces storage</div><div class="t-value">${csGbMonth.toFixed(2)}<span style="font-size:12px"> GB-mo</span></div><div class="t-sub">of ${lim.codespacesStorageGbMonth.toLocaleString()} GB-mo included</div></div>
     <div class="tile"><div class="t-label">Month net cost</div><div class="t-value">${usd(t.net)}</div><div class="t-sub">${usd(t.discount)} covered by included usage</div></div>`;
-
-  // daily usage chart
   const days = new Date(Date.UTC(t.y, t.m, 0)).getUTCDate();
+  const mon = new Date(Date.UTC(t.y, t.m - 1, 1)).toLocaleDateString(undefined, { month: "short", timeZone: "UTC" });
   let max = 0;
   const rows = [];
   for (let d = 1; d <= days; d++) {
@@ -323,23 +365,20 @@ function renderBilling(t) {
     const bars = (r.a || r.c)
       ? `<div class="d-bar d-actions" style="height:${max ? (r.a / max) * 100 : 0}%"></div><div class="d-bar d-cs" style="height:${max ? (r.c / max) * 100 : 0}%"></div>`
       : `<div class="d-zero"></div>`;
-    const mon = new Date(Date.UTC(t.y, t.m - 1, 1)).toLocaleDateString(undefined, { month: "short", timeZone: "UTC" });
     return `<div class="day" title="${mon} ${r.d} · ${Math.round(r.a)} min actions · ${r.c.toFixed(2)} core-h codespaces">${bars}</div>`;
   }).join("");
   const legend = `<div class="chart-legend">
-    <span><span class="legend-dot" style="background:var(--accent)"></span>Actions minutes / day</span>
-    <span><span class="legend-dot" style="background:var(--warn)"></span>Codespaces core-hours / day</span>
+    <span><span class="legend-dot" style="background:linear-gradient(180deg,#3cf0ba,#14b586)"></span>Actions minutes / day</span>
+    <span><span class="legend-dot" style="background:linear-gradient(180deg,#ffce85,#d69a35)"></span>Codespaces core-hours / day</span>
   </div>`;
-
-  body.innerHTML = `
+  $("billing-body").innerHTML = `
     <div class="tiles">${tiles}</div>
     ${metricBar("Actions minutes", t.actionsMin, lim.actionsMinutes, "min")}
     ${metricBar("Codespaces compute", t.csCoreHrs, lim.codespacesCoreHours, "core-h", 1)}
     ${metricBar("Codespaces storage", csGbMonth, lim.codespacesStorageGbMonth, "GB-mo", 2)}
     <div class="chart">${chart}</div>${legend}
-    <p class="b-cost">Gross ${usd(t.gross)} · covered ${usd(t.discount)} · net ${usd(t.net)} — from the GitHub billing usage report for this month.</p>`;
+    <p class="b-cost">Gross <b>${usd(t.gross)}</b> · covered <b>${usd(t.discount)}</b> · net <b>${usd(t.net)}</b> — from the GitHub billing usage report.</p>`;
 }
-
 function shiftMonth(dir) {
   const cur = billMonth || nowYM();
   const d = new Date(Date.UTC(cur.y, cur.m - 1 + dir, 1));
@@ -357,14 +396,26 @@ function toggleLimitsForm() {
   } else f.classList.add("hidden");
 }
 
-/* ---------------- wire up ---------------- */
-$("login-btn").addEventListener("click", login);
-$("token-input").addEventListener("keydown", (e) => { if (e.key === "Enter") login(); });
-$("token-visibility").addEventListener("click", () => {
-  const i = $("token-input");
+/* ================= refresh & init ================= */
+function refreshAll() {
+  if (!me) return;
+  loadRuns();
+  loadCodespaces();
+  if (!billMonth) loadBilling();
+}
+
+$("login-submit").addEventListener("click", doLogin);
+$("login-input").addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
+$("login-visibility").addEventListener("click", () => {
+  const i = $("login-input");
   i.type = i.type === "password" ? "text" : "password";
 });
-$("logout-btn").addEventListener("click", logout);
+$("login-close").addEventListener("click", () => closeModal("login-modal"));
+$("login-modal").addEventListener("click", (e) => { if (e.target === $("login-modal")) closeModal("login-modal"); });
+$("conn-close").addEventListener("click", () => closeModal("conn-modal"));
+$("conn-modal").addEventListener("click", (e) => { if (e.target === $("conn-modal")) closeModal("conn-modal"); });
+$("dispatch-form").addEventListener("submit", dispatch);
+$("cs-create-btn").addEventListener("click", createCodespace);
 $("bill-prev").addEventListener("click", () => shiftMonth(-1));
 $("bill-next").addEventListener("click", () => shiftMonth(1));
 $("limits-btn").addEventListener("click", toggleLimitsForm);
@@ -376,17 +427,28 @@ $("limits-save").addEventListener("click", () => {
   }));
   $("limits-form").classList.add("hidden");
   loadBilling();
+  toast("Limits saved.");
 });
-$("dispatch-form").addEventListener("submit", dispatch);
-$("cs-create-btn").addEventListener("click", createCodespace);
-$("modal-close").addEventListener("click", () => $("modal").classList.add("hidden"));
-$("modal").addEventListener("click", (e) => { if (e.target === $("modal")) $("modal").classList.add("hidden"); });
 
-if (token) {
-  api("/user").then((u) => {
-    me = u;
-    $("user-avatar").src = me.avatar_url;
-    $("user-login").textContent = me.login;
-    boot();
-  }).catch(() => { token = ""; localStorage.removeItem(KEY); });
-}
+(async function init() {
+  renderAuthArea();
+  if (token) {
+    try {
+      me = await api("/user");
+      renderAuthArea();
+      renderLocks();
+      $("runs-body").innerHTML = skeletons(3);
+      $("cs-body").innerHTML = skeletons(2);
+      $("billing-body").innerHTML = skeletons(3);
+      refreshAll();
+      startPolling();
+    } catch (e) {
+      token = ""; me = null;
+      localStorage.removeItem(KEY);
+      renderLocks();
+      toast("Saved token no longer works — sign in again.", "err");
+    }
+  } else {
+    renderLocks();
+  }
+})();
