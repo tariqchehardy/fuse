@@ -292,3 +292,6 @@ footer span { color: var(--accent); font-weight: 600; letter-spacing: 1.5px; }
 
 .gen-link { color: var(--accent); text-decoration: none; }
 .gen-link:hover { text-decoration: underline; }
+
+/* the hidden attribute must always win over display rules (lockcover, month-nav) */
+[hidden] { display: none !important; }
