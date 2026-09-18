@@ -96,6 +96,34 @@ function copyText(text, label) {
     .catch(() => toast("Clipboard blocked by the browser — copy manually.", "err"));
 }
 
+/* Strong RDP password generated client-side on each visit — no default
+   password ships in this public repo anymore. Charset avoids characters
+   that commonly break shell/YAML quoting in the workflow input. */
+function genPassword(len = 16) {
+  const upper = "ABCDEFGHJKLMNPQRSTUVWXYZ";
+  const lower = "abcdefghijkmnopqrstuvwxyz";
+  const digits = "23456789";
+  const symbols = "!@#%*+-=";
+  const all = upper + lower + digits + symbols;
+  const pick = (set) => {
+    const a = new Uint32Array(1);
+    crypto.getRandomValues(a);
+    return set[a[0] % set.length];
+  };
+  const pw = [pick(upper), pick(lower), pick(digits), pick(symbols)];
+  const arr = new Uint32Array(len - pw.length);
+  crypto.getRandomValues(arr);
+  for (const n of arr) pw.push(all[n % all.length]);
+  // Fisher-Yates shuffle with crypto randomness
+  const sh = new Uint32Array(pw.length);
+  crypto.getRandomValues(sh);
+  for (let i = pw.length - 1; i > 0; i--) {
+    const j = sh[i] % (i + 1);
+    [pw[i], pw[j]] = [pw[j], pw[i]];
+  }
+  return pw.join("");
+}
+
 /* ================= auth ================= */
 function openLogin() {
   $("login-error").classList.add("hidden");
@@ -216,8 +244,9 @@ async function completeOAuth() {
   const expected = sessionStorage.getItem("fuse_oauth_state");
   sessionStorage.removeItem("fuse_oauth_state");
   history.replaceState(null, "", location.pathname);
-  if (expected && q.get("state") !== expected) {
-    toast("Sign-in state mismatch — aborted for safety.", "err");
+  if (q.get("state") !== expected) {
+    toast(expected ? "Sign-in state mismatch — aborted for safety." :
+      "No sign-in in progress for this browser — start sign-in again.", "err");
     return false;
   }
   toast("Completing GitHub sign-in…");
@@ -248,9 +277,16 @@ async function dispatch(e) {
   e.preventDefault();
   if (!me) { openLogin(); return; }
   const btn = $("dispatch-btn");
-  btn.disabled = true; btn.classList.add("loading");
   const msg = $("dispatch-msg");
   msg.textContent = ""; msg.className = "";
+  const pw = $("rdp-pass").value;
+  if (pw.length < 8) {
+    msg.textContent = "RDP password must be at least 8 characters.";
+    msg.className = "err";
+    $("rdp-pass").focus();
+    return;
+  }
+  btn.disabled = true; btn.classList.add("loading");
   try {
     await api(`/repos/${OWNER}/${REPO}/actions/workflows/${WF}/dispatches`, {
       method: "POST",
@@ -756,6 +792,7 @@ $("limits-save").addEventListener("click", () => {
 document.addEventListener("visibilitychange", () => { if (!document.hidden && me) refreshAll(); });
 
 (async function init() {
+  if (!$("rdp-pass").value) $("rdp-pass").value = genPassword();
   renderAuthArea();
   const oauthDone = await completeOAuth();
   if (!oauthDone) {

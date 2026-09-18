@@ -9,7 +9,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="fuse.css?v=5">
+<link rel="stylesheet" href="fuse.css?v=6">
 </head>
 <body>
 
@@ -65,7 +65,8 @@
         </select>
       </label>
       <label>RDP username <input id="rdp-user" value="SovereignUser" spellcheck="false" autocomplete="off"></label>
-      <label>RDP password <input id="rdp-pass" value="PrivacyPlus2026!" spellcheck="false" autocomplete="off"></label>
+      <label>RDP password <span class="hint">(auto-generated each visit — type your own to override)</span>
+        <input id="rdp-pass" placeholder="generated on load" spellcheck="false" autocomplete="new-password" minlength="8"></label>
       <label>RDP port <input id="rdp-port" value="3389" inputmode="numeric" autocomplete="off"></label>
       <label class="check"><input id="auto-shutdown" type="checkbox" checked> Auto-shutdown on expiry</label>
       <label class="full">Tailscale auth key <span class="hint">(optional — blank uses the built-in TS_AUTHKEY repo secret)</span>
@@ -188,6 +189,6 @@
 </div>
 
 <div id="toasts" aria-live="polite"></div>
-<script src="fuse.js?v=5"></script>
+<script src="fuse.js?v=6"></script>
 </body>
 </html>
