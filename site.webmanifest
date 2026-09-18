@@ -1,0 +1,14 @@
+{
+  "name": "FUSE — Sovereign Workstation Dispatch Console",
+  "short_name": "FUSE",
+  "description": "Dispatch console for sovereign workstations — a static page talking straight to the GitHub REST API.",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#050d14",
+  "theme_color": "#050d14",
+  "icons": [
+    { "src": "favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "apple-touch-icon.png", "sizes": "180x180", "type": "image/png", "purpose": "any" },
+    { "src": "mark-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
