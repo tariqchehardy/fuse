@@ -18,7 +18,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="fuse.css?v=8">
+<link rel="stylesheet" href="fuse.css?v=9">
 </head>
 <body>
 
@@ -180,7 +180,7 @@
       <button id="login-close" class="icon-btn" aria-label="Close">&#10005;</button>
     </div>
     <div class="modal-pad">
-      <p>Sign in happens on github.com itself — FUSE never sees your password. Choose an account method:</p>
+      <p>Sign in with a GitHub token — FUSE never sees your password. <span id="oauth-avail" class="hidden"><b>Account sign-in</b> appears here once the optional access helper is configured; GitHub blocks password-style sign-in from static sites on its own.</span></p>
       <button id="oauth-btn" class="btn primary full-btn gh-btn">
         <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
         Continue with GitHub
@@ -196,8 +196,11 @@
           <button id="login-visibility" class="btn ghost" type="button" title="Show / hide">&#128065;</button>
         </div>
         <button id="login-submit" class="btn primary full-btn">Sign in with token</button>
-        <p class="fineprint">Stored only in this browser's localStorage · sent only to <code>api.github.com</code> ·
-          <a class="gen-link" href="https://github.com/settings/tokens/new?scopes=repo,workflow,user&description=FUSE%20console" target="_blank" rel="noopener">generate one with the right scopes ↗</a></p>
+        <p class="fineprint">Stored only in this browser's localStorage · sent only to <code>api.github.com</code>.<br>
+          Full console (owner / approved) — needs <code>repo,workflow</code>:
+          <a class="gen-link" href="https://github.com/settings/tokens/new?scopes=repo,workflow,user&description=FUSE%20console" target="_blank" rel="noopener">generate a console token ↗</a><br>
+          Just requesting access — any GitHub account, <code>public_repo</code> only:
+          <a class="gen-link" href="https://github.com/settings/tokens/new?scopes=public_repo&description=FUSE%20access%20request" target="_blank" rel="noopener">generate a request token ↗</a></p>
       </div>
       <p id="login-error" class="error hidden"></p>
     </div>
@@ -216,6 +219,6 @@
 </div>
 
 <div id="toasts" aria-live="polite"></div>
-<script src="fuse.js?v=8"></script>
+<script src="fuse.js?v=9"></script>
 </body>
 </html>

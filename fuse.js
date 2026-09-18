@@ -14,6 +14,9 @@ const RKEY = "fuse_refresh";   // GitHub App refresh token (rotated on every ref
 const LS_LIMITS = "fuse_limits";
 const OAUTH_EXCHANGE_URL_FALLBACK = "https://untitled.base44.app/functions/githubOauthExchange";
 const OWNER_LOGIN = "tariqchehardy";
+const FUSE_REPO = "tariqchehardy/fuse";                       // public: requests + approval list live here
+const APPROVED_URL = "approved.json";                        // static file on Pages (cache-busted)
+const REQ_TITLE = "Access request: ";                        // issue title convention
 // config.json (public, same repo) can point at the live access helper so the
 // helper URL never needs a code change: {"exchange_url":"https://…deno.dev"}
 let OAUTH_EXCHANGE_URL = OAUTH_EXCHANGE_URL_FALLBACK;
@@ -48,6 +51,9 @@ async function refreshOAuthToken() {
   } catch { return false; }
 }
 
+function ghHeaders(extra = {}) {
+  return { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", ...extra };
+}
 async function loadConfig() {
   // Prefer the repo's config.json for the helper URL (self-service: edit the
   // file on github.com after deploying the helper — no code change needed).
@@ -55,7 +61,7 @@ async function loadConfig() {
     const r = await fetch("config.json", { cache: "no-store" });
     if (r.ok) {
       const c = await r.json().catch(() => null);
-      if (c && typeof c.exchange_url === "string" && c.exchange_url) OAUTH_EXCHANGE_URL = c.exchange_url;
+      if (c && typeof c.exchange_url === "string" && c.exchange_url) { OAUTH_EXCHANGE_URL = c.exchange_url; window.__fuseHelperConfigured = true; }
     }
   } catch { /* keep fallback */ }
 }
@@ -73,13 +79,34 @@ async function helper(action, extra = {}) {
   }
   return d;
 }
+function helperAvailable() { return !!window.__fuseHelperConfigured; }
+async function approvedList() {
+  // approval list is a static file in the public fuse repo (Pages-served)
+  try {
+    const r = await fetch(`${APPROVED_URL}?v=${Date.now()}`, { cache: "no-store" });
+    if (!r.ok) return [];
+    const d = await r.json();
+    return Array.isArray(d.approved) ? d.approved.map((s) => String(s).toLowerCase()) : [];
+  } catch { return []; }
+}
+async function hasOpenRequest(login) {
+  // pending request = an open issue in the public fuse repo authored by this account
+  try {
+    const q = encodeURIComponent(`repo:${FUSE_REPO} is:issue is:open author:${login} in:title "${REQ_TITLE.trim()}"`);
+    const r = await fetch(`${API}/search/issues?q=${q}`, { headers: ghHeaders() });
+    if (!r.ok) return false;
+    const d = await r.json();
+    return d.total_count > 0;
+  } catch { return false; }
+}
 async function resolveRole() {
   if (!me) { myRole = "guest"; return; }
   if (me.login === OWNER_LOGIN) { myRole = "owner"; return; }
-  try {
-    const d = await helper("me", { token });
-    myRole = d.role || "none";
-  } catch { myRole = "none"; }
+  if (helperAvailable()) {
+    try { myRole = (await helper("me", { token })).role || "none"; return; } catch { /* fall through to GitHub-native */ }
+  }
+  if ((await approvedList()).includes(me.login.toLowerCase())) { myRole = "approved"; return; }
+  myRole = (await hasOpenRequest(me.login)) ? "pending" : "none";
 }
 
 async function api(path, opts = {}, retry = true) {
@@ -233,7 +260,7 @@ function logout() {
 function finishSignIn() {
   renderAuthArea();
   renderLocks();
-  if (myRole === "owner" || myRole === "approved") {
+  if (myRole === "owner" || (myRole === "approved" && helperAvailable())) {
     $("ws-body").innerHTML = skeletons(4);
     $("cs-body").innerHTML = skeletons(2);
     if (myRole === "owner") {
@@ -268,6 +295,13 @@ function requestHTML(what) {
     <button class="btn primary sm" data-request-access>Request access</button>
   </div>`;
 }
+function relayNeededHTML(what) {
+  return `<div class="locked">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <circle cx="12" cy="12" r="9"/><path d="M8 12h8"/></svg>
+    <p><b>${esc(me ? me.login : "")}</b> is approved — but live console actions (${what}) need the access relay to be enabled by <b>${esc(OWNER_LOGIN)}</b>.</p>
+  </div>`;
+}
 function pendingHTML(what) {
   return `<div class="locked">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
@@ -292,20 +326,23 @@ function renderRequestStrip() {
 }
 function renderLocks() {
   const authed = me && (myRole === "owner" || myRole === "approved");
+  const authedFull = authed && (myRole !== "approved" || helperAvailable());
   $("guest-strip").hidden = !!me;
   renderRequestStrip();
-  $("lock-dispatch").hidden = authed;
+  $("lock-dispatch").hidden = authedFull;
   $("bill-nav").hidden = myRole !== "owner";
   $("billing-card").hidden = myRole !== "owner";
   $("access-card").hidden = myRole !== "owner";
-  $("cs-create-btn").hidden = !authed;
+  $("cs-create-btn").hidden = !authedFull;
   const bodies = {
     "cs-body": "manage codespace exit nodes",
     "ws-body": "see running workstations, stats and RDP access",
   };
   for (const [id, what] of Object.entries(bodies)) {
-    if (!authed) {
-      $(id).innerHTML = !me ? lockedHTML(what) : (myRole === "pending" ? pendingHTML(what) : requestHTML(what));
+    if (!authedFull) {
+      $(id).innerHTML = !me ? lockedHTML(what)
+        : (myRole === "approved" ? relayNeededHTML(what)
+        : (myRole === "pending" ? pendingHTML(what) : requestHTML(what)));
       bindLoginButtons($(id));
       bindRequestButtons($(id));
     }
@@ -873,6 +910,24 @@ function toggleLimitsForm() {
 
 /* ================= access control (multi-account) ================= */
 async function requestAccess() {
+  if (!helperAvailable()) {
+    // GitHub-native: file the request as an issue on the public fuse repo.
+    const title = `${REQ_TITLE}${me.login}`;
+    try {
+      await api(`/repos/${FUSE_REPO}/issues`, {
+        method: "POST",
+        body: JSON.stringify({ title, body: `Access request filed from the FUSE console.\n\n- Login: ${me.login}\n- Requested: ${new Date().toISOString()}` }),
+      });
+      myRole = "pending";
+      renderLocks();
+      toast("Request filed — the console unlocks here once approved.", "ok");
+    } catch (e) {
+      // token lacks issue rights: hand them a prefilled issue instead (any GitHub account can submit it)
+      window.open(`https://github.com/${FUSE_REPO}/issues/new?title=${encodeURIComponent(title)}`, "_blank", "noopener");
+      toast("Opened a prefilled issue on GitHub — hit Submit there to send your request.", "ok");
+    }
+    return;
+  }
   try {
     const d = await helper("request_access", { token });
     myRole = d.role || "pending";
@@ -882,8 +937,31 @@ async function requestAccess() {
         : "Request registered.", "ok");
   } catch (e) { toast(`Request failed: ${e.message}`, "err"); }
 }
+async function ghApprove(login) {
+  // commit the login into approved.json (static, public, Pages-served)
+  let cur = { approved: [] }, sha = null;
+  const g = await fetch(`${API}/repos/${FUSE_REPO}/contents/approved.json`, { headers: ghHeaders() });
+  if (g.ok) {
+    const f = await g.json();
+    sha = f.sha;
+    try { cur = JSON.parse(atob(f.content.replace(/\n/g, ""))); } catch { cur = { approved: [] }; }
+  }
+  const list = Array.isArray(cur.approved) ? cur.approved : [];
+  if (!list.includes(login)) list.push(login);
+  const put = await fetch(`${API}/repos/${FUSE_REPO}/contents/approved.json`, {
+    method: "PUT",
+    headers: ghHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({
+      message: `approve: ${login}`,
+      content: btoa(JSON.stringify({ approved: list }, null, 2)),
+      sha: sha || undefined,
+    }),
+  });
+  if (!put.ok) throw new Error(`approved.json commit failed (${put.status})`);
+}
 async function loadRequests() {
   if (myRole !== "owner") return;
+  if (!helperAvailable()) return loadRequestsIssues();
   const wrap = $("access-body");
   try {
     const d = await helper("list_requests", { token });
@@ -911,6 +989,56 @@ async function decide(login, decision, btn) {
     toast(decision === "approve"
       ? `${login} approved — they can now sign in and use FUSE without repo access.`
       : `${login} denied.`);
+    loadRequests();
+  } catch (e) {
+    toast(`Failed: ${e.message}`, "err");
+    btn.disabled = false;
+  }
+}
+
+/* ---------- GitHub-native access requests (issues + approved.json, no helper) ---------- */
+function loginFromTitle(title) { return String(title || "").slice(REQ_TITLE.length).trim(); }
+async function loadRequestsIssues() {
+  const wrap = $("access-body");
+  try {
+    const rs = [];
+    let page = 1;
+    while (page <= 3) { // up to 150 open issues scanned
+      const d = await api(`/repos/${FUSE_REPO}/issues?state=open&per_page=50&page=${page++}`);
+      rs.push(...(d || []).filter((i) => !i.pull_request && i.title && i.title.startsWith(REQ_TITLE)));
+      if (!d || d.length < 50) break;
+    }
+    $("access-count").textContent = rs.length ? `${rs.length} pending` : "none pending";
+    wrap.innerHTML = rs.length ? rs.map((r) => `
+      <div class="run">
+        <img class="avatar sm" src="${esc(r.user && r.user.avatar_url)}" alt="">
+        <div class="meta">${esc(loginFromTitle(r.title))}
+          <div class="sub">requested ${ago(r.created_at)} · <a href="${esc(r.html_url)}" target="_blank" rel="noopener">issue #${r.number}</a></div>
+        </div>
+        <button class="btn primary sm" data-approve="${esc(loginFromTitle(r.title))}" data-num="${r.number}">Approve</button>
+        <button class="btn danger sm" data-deny="${esc(loginFromTitle(r.title))}" data-num="${r.number}">Deny</button>
+      </div>`).join("") : `<p class="muted">No pending requests — requests arrive as issues on ${FUSE_REPO}.</p>`;
+    wrap.querySelectorAll("[data-approve]").forEach((b) => b.addEventListener("click", () => decideIssue(b.dataset.approve, b.dataset.num, "approve", b)));
+    wrap.querySelectorAll("[data-deny]").forEach((b) => b.addEventListener("click", () => decideIssue(b.dataset.deny, b.dataset.num, "deny", b)));
+  } catch (e) {
+    wrap.innerHTML = `<p class="error">Access requests unavailable: ${esc(e.message)}</p>`;
+  }
+}
+async function decideIssue(login, num, decision, btn) {
+  btn.disabled = true;
+  try {
+    if (decision === "approve") await ghApprove(login);
+    await api(`/repos/${FUSE_REPO}/issues/${num}`, {
+      method: "PATCH",
+      body: JSON.stringify({ state: "closed" }),
+    });
+    await api(`/repos/${FUSE_REPO}/issues/${num}/comments`, {
+      method: "POST",
+      body: JSON.stringify({ body: decision === "approve"
+        ? `Approved by ${OWNER_LOGIN} — you can now use the FUSE console. Welcome aboard.` 
+        : `Request declined by ${OWNER_LOGIN}.` }),
+    });
+    toast(decision === "approve" ? `${login} approved — approved.json updated, they can use FUSE now.` : `${login} denied.`);
     loadRequests();
   } catch (e) {
     toast(`Failed: ${e.message}`, "err");

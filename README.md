@@ -6,7 +6,7 @@
 
 ## What it does
 
-- **GitHub account sign-in** — "Continue with GitHub" runs the OAuth web flow (login happens on github.com itself with your email + password; FUSE never sees it). One tiny serverless helper holds the OAuth client secret for the code exchange (URL lives in `config.json`).
+- **GitHub-only mode (default, zero hosting)** — sign-in is by GitHub token. Access requests are issues on this public repo (`Access request: <login>`); approvals are commits to `approved.json`, both done from the console. No backend exists anywhere: GitHub Pages serves the page, api.github.com is the only API FUSE talks to. GitHub's own OAuth endpoints send no CORS headers (verified), so a static site cannot do password-style account sign-in without a relay — that's what the optional helper below is for.
 - **Multi-account access with approvals** — any GitHub user can sign in. Non-owner accounts land on a "request access" prompt; the owner approves or denies them from the **Access Requests** card. Approved accounts get the full console (dispatch, workstations, exit nodes) via the helper's whitelisted installation-token proxy — **no access to the private repo required or granted**. Billing stays owner-only.
 - **Optional token sign-in** — a personal access token remains available as an advanced fallback (stored only in your browser's localStorage, sent only to `api.github.com`).
 - **Ignite a sovereign workstation** — dispatches the provisioning workflow with your chosen session duration, RDP credentials, and auto-shutdown. The Tailscale key is built in (`TS_AUTHKEY` repo secret); no pasting.
