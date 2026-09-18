@@ -12,11 +12,16 @@ const API = "https://api.github.com";
 const KEY = "fuse_token";
 const RKEY = "fuse_refresh";   // GitHub App refresh token (rotated on every refresh)
 const LS_LIMITS = "fuse_limits";
-const OAUTH_EXCHANGE_URL = "https://untitled.base44.app/functions/githubOauthExchange";
+const OAUTH_EXCHANGE_URL_FALLBACK = "https://untitled.base44.app/functions/githubOauthExchange";
+const OWNER_LOGIN = "tariqchehardy";
+// config.json (public, same repo) can point at the live access helper so the
+// helper URL never needs a code change: {"exchange_url":"https://…deno.dev"}
+let OAUTH_EXCHANGE_URL = OAUTH_EXCHANGE_URL_FALLBACK;
 
 const $ = (id) => document.getElementById(id);
 let token = localStorage.getItem(KEY) || "";
 let me = null;
+let myRole = "guest";   // guest | owner | approved | pending | none
 let timer = null;
 let billMonth = null;
 let oauthCfg = null;
@@ -43,7 +48,44 @@ async function refreshOAuthToken() {
   } catch { return false; }
 }
 
+async function loadConfig() {
+  // Prefer the repo's config.json for the helper URL (self-service: edit the
+  // file on github.com after deploying the helper — no code change needed).
+  try {
+    const r = await fetch("config.json", { cache: "no-store" });
+    if (r.ok) {
+      const c = await r.json().catch(() => null);
+      if (c && typeof c.exchange_url === "string" && c.exchange_url) OAUTH_EXCHANGE_URL = c.exchange_url;
+    }
+  } catch { /* keep fallback */ }
+}
+async function helper(action, extra = {}) {
+  const r = await fetch(OAUTH_EXCHANGE_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ action, ...extra }),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const e = new Error(d.message || d.error || `helper ${action} failed (${r.status})`);
+    e.status = r.status;
+    throw e;
+  }
+  return d;
+}
+async function resolveRole() {
+  if (!me) { myRole = "guest"; return; }
+  if (me.login === OWNER_LOGIN) { myRole = "owner"; return; }
+  try {
+    const d = await helper("me", { token });
+    myRole = d.role || "none";
+  } catch { myRole = "none"; }
+}
+
 async function api(path, opts = {}, retry = true) {
+  // Approved non-owner accounts reach the private repo through the helper's
+  // whitelisted proxy (installation token server-side). Owner stays direct.
+  if (myRole === "approved" && path.startsWith("/repos/")) return relayApi(path, opts, retry);
   const res = await fetch(`${API}${path}`, {
     ...opts,
     headers: {
@@ -65,6 +107,29 @@ async function api(path, opts = {}, retry = true) {
     throw err;
   }
   return res.status === 204 ? null : res.json();
+}
+
+async function relayApi(path, opts = {}, retry = true) {
+  let bodyObj = null;
+  if (opts.body) { try { bodyObj = JSON.parse(opts.body); } catch { bodyObj = null; } }
+  try {
+    const d = await helper("proxy", { token, method: (opts.method || "GET").toUpperCase(), path, body: bodyObj });
+    if (d.status === 204 || d.status === 202) return null;
+    if (d.status >= 400) {
+      const e = new Error((d.body && d.body.message) || `HTTP ${d.status}`);
+      e.status = d.status;
+      throw e;
+    }
+    return typeof d.body === "string" && d.body === "" ? null : d.body;
+  } catch (e) {
+    if (e.status === 401 && retry && localStorage.getItem(RKEY)) {
+      if (await refreshOAuthToken()) return relayApi(path, opts, false);
+    }
+    throw e;
+  }
+}
+async function relayRaw(path) { // for job logs / the artifact zip (returns {status, ...})
+  return helper("proxy", { token, method: "GET", path });
 }
 
 /* ================= UI helpers ================= */
@@ -141,6 +206,7 @@ async function doLogin() {
     me = await api("/user");
     localStorage.setItem(KEY, t);
     closeModal("login-modal");
+    await resolveRole();
     finishSignIn();
     toast(`Signed in as ${me.login} — console unlocked.`);
   } catch (e) {
@@ -157,7 +223,8 @@ async function doLogin() {
 function logout() {
   localStorage.removeItem(KEY);
   localStorage.removeItem(RKEY);
-  token = ""; me = null; activeInfo = null; logCache = {};
+  token = ""; me = null; myRole = "guest"; activeInfo = null; logCache = {};
+  $("access-card").hidden = true;
   clearInterval(timer); timer = null;
   renderAuthArea();
   renderLocks();
@@ -166,11 +233,16 @@ function logout() {
 function finishSignIn() {
   renderAuthArea();
   renderLocks();
-  $("ws-body").innerHTML = skeletons(4);
-  $("cs-body").innerHTML = skeletons(2);
-  $("billing-body").innerHTML = skeletons(3);
-  refreshAll();
-  startPolling();
+  if (myRole === "owner" || myRole === "approved") {
+    $("ws-body").innerHTML = skeletons(4);
+    $("cs-body").innerHTML = skeletons(2);
+    if (myRole === "owner") {
+      $("billing-body").innerHTML = skeletons(3);
+      loadRequests();
+    }
+    refreshAll();
+    startPolling();
+  }
 }
 function renderAuthArea() {
   const a = $("auth-area");
@@ -187,19 +259,56 @@ function renderAuthArea() {
     $("open-login").addEventListener("click", openLogin);
   }
 }
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+function requestHTML(what) {
+  return `<div class="locked">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <circle cx="12" cy="12" r="9"/><path d="M10 12h4M12 8v8"/></svg>
+    <p>Signed in as <b>${esc(me ? me.login : "")}</b>, but this account isn't approved to ${what}.</p>
+    <button class="btn primary sm" data-request-access>Request access</button>
+  </div>`;
+}
+function pendingHTML(what) {
+  return `<div class="locked">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
+    <p>Access request pending — you'll be able to ${what} as soon as <b>${esc(OWNER_LOGIN)}</b> approves this account.</p>
+  </div>`;
+}
+function bindRequestButtons(root) {
+  root.querySelectorAll("[data-request-access]").forEach((b) => b.addEventListener("click", requestAccess));
+}
+function renderRequestStrip() {
+  const strip = $("request-strip");
+  if (!me || myRole === "owner" || myRole === "approved") { strip.hidden = true; return; }
+  strip.hidden = false;
+  if (myRole === "pending") {
+    $("request-msg").textContent = `Access request pending for ${me.login} — the console unlocks here as soon as it's approved.`;
+    $("request-btn").hidden = true;
+  } else {
+    $("request-msg").textContent = `Signed in as ${me.login} — this console is for approved accounts.`;
+    $("request-btn").hidden = false;
+  }
+}
 function renderLocks() {
-  const authed = !!me;
-  $("guest-strip").hidden = authed;
+  const authed = me && (myRole === "owner" || myRole === "approved");
+  $("guest-strip").hidden = !!me;
+  renderRequestStrip();
   $("lock-dispatch").hidden = authed;
-  $("bill-nav").hidden = !authed;
+  $("bill-nav").hidden = myRole !== "owner";
+  $("billing-card").hidden = myRole !== "owner";
+  $("access-card").hidden = myRole !== "owner";
   $("cs-create-btn").hidden = !authed;
   const bodies = {
-    "billing-body": "load billing and usage",
     "cs-body": "manage codespace exit nodes",
     "ws-body": "see running workstations, stats and RDP access",
   };
   for (const [id, what] of Object.entries(bodies)) {
-    if (!authed) { $(id).innerHTML = lockedHTML(what); bindLoginButtons($(id)); }
+    if (!authed) {
+      $(id).innerHTML = !me ? lockedHTML(what) : (myRole === "pending" ? pendingHTML(what) : requestHTML(what));
+      bindLoginButtons($(id));
+      bindRequestButtons($(id));
+    }
   }
 }
 function startPolling() {
@@ -262,6 +371,7 @@ async function completeOAuth() {
     localStorage.setItem(KEY, token);
     if (data.refresh_token) localStorage.setItem(RKEY, data.refresh_token);
     me = await api("/user");
+    await resolveRole();
     finishSignIn();
     toast(`Welcome back, ${me.login} — signed in with GitHub.`);
     return true;
@@ -350,6 +460,11 @@ async function fetchJobLog(run) {
   const jobs = await api(`/repos/${OWNER}/${REPO}/actions/runs/${run.id}/jobs`);
   const job = (jobs.jobs || []).find((j) => j.name.includes("Provision")) || (jobs.jobs || [])[0];
   if (!job) throw new Error("no jobs found on this run");
+  if (myRole === "approved") {
+    const d = await relayRaw(`/repos/${OWNER}/${REPO}/actions/jobs/${job.id}/logs`);
+    if (d.status >= 400) throw new Error(`job log HTTP ${d.status}`);
+    return typeof d.body === "string" ? d.body : JSON.stringify(d.body);
+  }
   const res = await fetch(`${API}/repos/${OWNER}/${REPO}/actions/jobs/${job.id}/logs`, {
     headers: { Authorization: `Bearer ${token}`, "X-GitHub-Api-Version": "2022-11-28" },
   });
@@ -491,6 +606,13 @@ async function fetchArtifactInfo(run) {
   const art = (arts.artifacts || []).find(
     (a) => a.workflow_run && a.workflow_run.id === run.id && a.name === "connection-info" && !a.expired);
   if (!art) return null;
+  if (myRole === "approved") {
+    const d = await relayRaw(`/repos/${OWNER}/${REPO}/actions/artifacts/${art.id}/zip`);
+    if (d.status >= 400) throw new Error(`artifact zip HTTP ${d.status}`);
+    const bin = Uint8Array.from(atob(d.body_b64), (c) => c.charCodeAt(0));
+    const txt = await unzipFirstText(bin.buffer, "connection-info");
+    return { info: parseArtifactInfo(txt), raw: txt };
+  }
   const res = await fetch(`${API}/repos/${OWNER}/${REPO}/actions/artifacts/${art.id}/zip`, {
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
   });
@@ -628,7 +750,10 @@ async function loadCodespaces() {
       b.addEventListener("click", async () => {
         b.disabled = true;
         try {
-          await api(`/user/codespaces/${b.dataset.csDel}`, { method: "DELETE" });
+          const delPath = myRole === "approved"
+            ? `/repos/${OWNER}/${REPO}/codespaces/${b.dataset.csDel}`
+            : `/user/codespaces/${b.dataset.csDel}`;
+          await api(delPath, { method: "DELETE" });
           toast("Codespace deleted — node removed from the tailnet.");
         } catch (err) { toast(`Delete failed: ${err.message}`, "err"); }
         loadCodespaces();
@@ -746,12 +871,60 @@ function toggleLimitsForm() {
   } else f.classList.add("hidden");
 }
 
+/* ================= access control (multi-account) ================= */
+async function requestAccess() {
+  try {
+    const d = await helper("request_access", { token });
+    myRole = d.role || "pending";
+    renderLocks();
+    toast(myRole === "pending" ? "Request sent — the console unlocks here as soon as it's approved."
+        : myRole === "approved" ? "You're already approved — the console is unlocked."
+        : "Request registered.", "ok");
+  } catch (e) { toast(`Request failed: ${e.message}`, "err"); }
+}
+async function loadRequests() {
+  if (myRole !== "owner") return;
+  const wrap = $("access-body");
+  try {
+    const d = await helper("list_requests", { token });
+    const rs = d.requests || [];
+    $("access-count").textContent = rs.length ? `${rs.length} pending` : "none pending";
+    wrap.innerHTML = rs.length ? rs.map((r) => `
+      <div class="run">
+        <img class="avatar sm" src="${esc(r.avatar_url)}" alt="">
+        <div class="meta">${esc(r.login)}
+          <div class="sub">requested ${ago(r.requested_at)}${r.note ? ` · “${esc(r.note)}”` : ""}</div>
+        </div>
+        <button class="btn primary sm" data-approve="${esc(r.login)}">Approve</button>
+        <button class="btn danger sm" data-deny="${esc(r.login)}">Deny</button>
+      </div>`).join("") : `<p class="muted">No pending requests — approved accounts are listed in the helper's KV store.</p>`;
+    wrap.querySelectorAll("[data-approve]").forEach((b) => b.addEventListener("click", () => decide(b.dataset.approve, "approve", b)));
+    wrap.querySelectorAll("[data-deny]").forEach((b) => b.addEventListener("click", () => decide(b.dataset.deny, "deny", b)));
+  } catch (e) {
+    wrap.innerHTML = `<p class="error">Access requests unavailable: ${esc(e.message)}</p>`;
+  }
+}
+async function decide(login, decision, btn) {
+  btn.disabled = true;
+  try {
+    await helper("decide", { token, login, decision });
+    toast(decision === "approve"
+      ? `${login} approved — they can now sign in and use FUSE without repo access.`
+      : `${login} denied.`);
+    loadRequests();
+  } catch (e) {
+    toast(`Failed: ${e.message}`, "err");
+    btn.disabled = false;
+  }
+}
+
 /* ================= refresh & init ================= */
 function refreshAll() {
   if (!me || document.hidden) return;
   loadWorkstations();
   loadCodespaces();
-  if (!billMonth) loadBilling();
+  if (myRole === "owner") loadRequests();
+  if (!billMonth && myRole === "owner") loadBilling();
 }
 
 /* wire up */
@@ -774,6 +947,7 @@ $("conn-modal").addEventListener("click", (e) => { if (e.target === $("conn-moda
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") { closeModal("login-modal"); closeModal("conn-modal"); }
 });
+$("request-btn").addEventListener("click", requestAccess);
 $("dispatch-form").addEventListener("submit", dispatch);
 $("cs-create-btn").addEventListener("click", createCodespace);
 $("bill-prev").addEventListener("click", () => shiftMonth(-1));
@@ -794,11 +968,13 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden && me
 (async function init() {
   if (!$("rdp-pass").value) $("rdp-pass").value = genPassword();
   renderAuthArea();
+  await loadConfig();
   const oauthDone = await completeOAuth();
   if (!oauthDone) {
     if (token) {
       try {
         me = await api("/user");
+        await resolveRole();
         finishSignIn();
       } catch (e) {
         token = ""; me = null;

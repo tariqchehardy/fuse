@@ -6,7 +6,8 @@
 
 ## What it does
 
-- **GitHub account sign-in** — "Continue with GitHub" runs the OAuth web flow (login happens on github.com itself with your email + password; FUSE never sees it). One tiny serverless helper holds the OAuth client secret for the code exchange.
+- **GitHub account sign-in** — "Continue with GitHub" runs the OAuth web flow (login happens on github.com itself with your email + password; FUSE never sees it). One tiny serverless helper holds the OAuth client secret for the code exchange (URL lives in `config.json`).
+- **Multi-account access with approvals** — any GitHub user can sign in. Non-owner accounts land on a "request access" prompt; the owner approves or denies them from the **Access Requests** card. Approved accounts get the full console (dispatch, workstations, exit nodes) via the helper's whitelisted installation-token proxy — **no access to the private repo required or granted**. Billing stays owner-only.
 - **Optional token sign-in** — a personal access token remains available as an advanced fallback (stored only in your browser's localStorage, sent only to `api.github.com`).
 - **Ignite a sovereign workstation** — dispatches the provisioning workflow with your chosen session duration, RDP credentials, and auto-shutdown. The Tailscale key is built in (`TS_AUTHKEY` repo secret); no pasting.
 - **Create a codespace exit node** — one button. Codespaces join the tailnet automatically as dedicated **ephemeral exit nodes**.
@@ -21,5 +22,6 @@
 
 ## Notes
 
-- FUSE is a static page — there is no server, no tracking, and no backend. Your token never leaves the browser.
+- FUSE is a static page — there is no tracking. Owner tokens never leave the browser; approved users' actions run through the helper's server-side proxy with an installation token scoped to whitelisted paths on this repo only.
+- Access helper setup (Deno Deploy, free, ~5 min): see `oauth-helper/README.md`, then set its URL in `config.json`.
 - It's public because GitHub Pages on the free plan requires public repos; flip the repo to private if your plan supports private Pages.

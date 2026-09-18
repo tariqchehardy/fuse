@@ -1,8 +1,14 @@
-# OAuth / GitHub App exchange helper (Deno Deploy)
+# FUSE access helper (Deno Deploy)
 
-GitHub account sign-in on FUSE needs one tiny server-side piece: the OAuth
-code → token exchange (GitHub's token endpoint sends no CORS headers, and
-the client secret must not ship in browser code). This is it.
+FUSE needs one tiny server-side piece: the OAuth code → token exchange
+(GitHub's token endpoint sends no CORS headers, and the client secret must
+not ship in browser code). The same helper now also powers multi-account
+access: any GitHub user can sign in and request access, the owner approves
+from the FUSE "Access Requests" card, and approved accounts use the console
+through a **whitelisted installation-token proxy** — they never need access
+to the private `sovereign-workstation` repo.
+
+Requests and approvals are stored in **Deno KV** (free, zero config).
 
 ## Deploy (free, ~5 minutes)
 
@@ -10,28 +16,48 @@ the client secret must not ship in browser code). This is it.
 2. **New Playground** → paste the contents of `deno-deploy.ts` → Save.
 3. Project **Settings → Environment Variables**, add:
    - `GITHUB_OAUTH_CLIENT_ID` = your **GitHub App client ID** (starts with `Iv…`, public by design)
-   - `GITHUB_OAUTH_CLIENT_SECRET` = the GitHub App's client secret  *(GitHub → Settings → Developer settings → GitHub Apps → your app)*
+   - `GITHUB_OAUTH_CLIENT_SECRET` = the GitHub App's client secret
+   - `GITHUB_APP_ID` = the GitHub App's numeric ID *(enables the proxy for approved users)*
+   - `GITHUB_APP_PRIVATE_KEY` = the full `.pem` private key from the app's settings page *(paste all of it, header lines included)*
+   - `GITHUB_INSTALLATION_ID` = optional — auto-discovered from the installation on the repo owner account if unset
+   - `FUSE_OWNER_LOGIN` = optional, default `tariqchehardy`
+   - `FUSE_REPO` = optional, default `tariqchehardy/sovereign-workstation`
 4. **Save & Deploy** — note the URL, e.g. `https://fuse-oauth.deno.dev`.
-5. Tell the agent the URL (or open a PR changing `OAUTH_EXCHANGE_URL` in `fuse.js`).
+5. Put that URL into the fuse repo's **`config.json`**:
+   ```json
+   { "exchange_url": "https://fuse-oauth.deno.dev" }
+   ```
+   That's it — FUSE picks it up on the next page load, no code change needed.
 
 ## Verify
 
 ```bash
 curl https://<your-project>.deno.dev
-# {"configured":true,"client_id":"Ov23lirxWZffC9YVcJzD","redirect_uri":"https://tariqchehardy.github.io/fuse/"}
+# {"configured":true,"client_id":"Iv…","redirect_uri":"https://tariqchehardy.github.io/fuse/","proxy_ready":true,"owner_login":"tariqchehardy"}
 ```
 
-## Notes
+`proxy_ready: true` means the multi-user proxy is armed.
 
-- Sign-in uses a **GitHub App** (user-to-server flow). GitHub App user tokens
-  expire after 8h; this helper rotates them via refresh tokens automatically
-  when FUSE asks (FUSE retries any 401 once through the helper).
-- The GitHub App must have **Callback URL** set to
-  `https://tariqchehardy.github.io/fuse/` (Homepage URL: same).
-- Repository permissions on the app: **Actions: Read & write**,
-  **Contents: Read-only**, **Codespaces: Read & write**
-  (Metadata: Read-only is mandatory). Install the app on the
-  `sovereign-workstation` repo.
-- The helper only accepts requests from the FUSE origin (CORS is pinned).
-- The secret lives only in Deno Deploy env vars — never in this repo, never in the browser.
+## The GitHub App (one-time setup)
+
+- **Callback URL** and **Homepage URL**: `https://tariqchehardy.github.io/fuse/`
+- Repository permissions: **Actions: Read & write**, **Contents: Read-only**,
+  **Codespaces: Read & write** (Metadata: Read-only is mandatory).
+- Install the app on the `sovereign-workstation` repo.
+
+## How access works
+
+- **Owner** (`FUSE_OWNER_LOGIN`): full console directly, plus the Access
+  Requests card.
+- **Any other GitHub user**: signs in with the same "Continue with GitHub"
+  flow, sees the request-access prompt, and after approval gets dispatch +
+  workstations + exit nodes — all relayed through the helper's installation
+  token. Only whitelisted API paths on the FUSE repo are allowed (workflow
+  dispatch, runs/jobs/logs, artifacts, codespaces). Billing stays owner-only.
+- User-to-server tokens expire after 8h; the helper rotates them via refresh
+  tokens (FUSE retries any 401 once through the helper).
+- The client secret and app private key live only in Deno Deploy env vars —
+  never in this repo, never in the browser.
+- CORS is pinned to the FUSE origin; request lists and approvals are
+  owner-only (verified against GitHub's `/user` on every call).
 - Free tier: 1M requests/day — far beyond anything FUSE needs.
