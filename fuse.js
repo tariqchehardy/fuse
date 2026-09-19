@@ -1,35 +1,49 @@
 "use strict";
-/* FUSE — dispatch console for sovereign workstations.
-   Static page talking straight to the GitHub REST API from the browser.
-   Sign-in: GitHub account (GitHub App user-to-server flow via a tiny
-   exchange helper — tokens expire in 8h and auto-refresh) or a personal
-   access token (advanced, optional). Tokens live only in localStorage. */
+/* FUSE — sovereign workstation dispatch console (multi-tenant).
+   A static page talking straight to the GitHub REST API from the browser.
+   Every signed-in GitHub account hosts ITSELF: the console creates a private
+   <login>/sovereign-workstation repo from the bundled template, stores the
+   user's Tailscale key as their own repo secret, and dispatches the
+   provisioning workflow there — billed to their account, tokens staying in
+   their browser. Sign-in: GitHub App user-to-server flow via a tiny exchange
+   helper (tokens expire in 8h and auto-refresh) or a personal access token. */
 
-const OWNER = "Privacy-Technologies";
 const REPO = "sovereign-workstation";
 const WF = "provision-sovereign-workstation.yml";
 const API = "https://api.github.com";
 const KEY = "fuse_token";
 const RKEY = "fuse_refresh";   // GitHub App refresh token (rotated on every refresh)
 const LS_LIMITS = "fuse_limits";
-const OAUTH_EXCHANGE_URL_FALLBACK = "https://untitled.base44.app/functions/githubOauthExchange";
-const OWNER_LOGIN = "tariqchehardy";
-const FUSE_REPO = "fusedispatch/fusedispatch.github.io";                       // public: requests + approval list live here
-const APPROVED_URL = "approved.json";                        // static file on Pages (cache-busted)
-const REQ_TITLE = "Access request: ";                        // issue title convention
-// config.json (public, same repo) can point at the live access helper so the
-// helper URL never needs a code change: {"exchange_url":"https://…deno.dev"}
+const APP_ID = 4999879;
+const APP_SLUG = "fuse-console";
+const INSTALL_URL = `https://github.com/apps/${APP_SLUG}/installations/new`;
+const OAUTH_EXCHANGE_URL_FALLBACK = "https://fuse-oauth-helper.tariqchehardy.deno.net";
+// config.json (public, same repo) can point at the live exchange helper so the
+// helper URL never needs a code change: {"exchange_url":"https://…"}
 let OAUTH_EXCHANGE_URL = OAUTH_EXCHANGE_URL_FALLBACK;
+
+// The console bundles the whole workstation template as static files and
+// clones it into each tenant's repo on first sign-in (dot-free Pages paths).
+const TEMPLATE_FILES = [
+  { src: "template/github/workflows/provision-sovereign-workstation.yml", dest: ".github/workflows/" + WF },
+  { src: "template/devcontainer.json", dest: ".devcontainer/devcontainer.json" },
+  { src: "template/setup.ps1", dest: ".devcontainer/setup.ps1" },
+  { src: "template/tailscale-exit-node.sh", dest: ".devcontainer/tailscale-exit-node.sh" },
+  { src: "template/README.md", dest: "README.md", overwrite: true },
+];
 
 const $ = (id) => document.getElementById(id);
 let token = localStorage.getItem(KEY) || "";
 let me = null;
-let myRole = "guest";   // guest | owner | approved | pending | none
+let installed = false;    // FUSE Console app installed for this user
+let repoReady = false;    // tenant repo exists with the template in place
+let tsKeySet = false;     // TS_AUTHKEY actions secret present in the tenant repo
 let timer = null;
 let billMonth = null;
 let oauthCfg = null;
 let logCache = {};        // runId -> { ts, info, raw }
 let activeInfo = null;   // parsed info of the running VM
+const full = () => `${me.login}/${REPO}`;   // tenant repo path
 
 /* ================= API ================= */
 async function refreshOAuthToken() {
@@ -50,18 +64,15 @@ async function refreshOAuthToken() {
     return true;
   } catch { return false; }
 }
-
 function ghHeaders(extra = {}) {
   return { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", ...extra };
 }
 async function loadConfig() {
-  // Prefer the repo's config.json for the helper URL (self-service: edit the
-  // file on github.com after deploying the helper — no code change needed).
   try {
     const r = await fetch("config.json", { cache: "no-store" });
     if (r.ok) {
       const c = await r.json().catch(() => null);
-      if (c && typeof c.exchange_url === "string" && c.exchange_url) { OAUTH_EXCHANGE_URL = c.exchange_url; window.__fuseHelperConfigured = true; }
+      if (c && typeof c.exchange_url === "string" && c.exchange_url) OAUTH_EXCHANGE_URL = c.exchange_url;
     }
   } catch { /* keep fallback */ }
 }
@@ -79,40 +90,8 @@ async function helper(action, extra = {}) {
   }
   return d;
 }
-function helperAvailable() { return !!window.__fuseHelperConfigured; }
-async function approvedList() {
-  // approval list is a static file in the public fuse repo (Pages-served)
-  try {
-    const r = await fetch(`${APPROVED_URL}?v=${Date.now()}`, { cache: "no-store" });
-    if (!r.ok) return [];
-    const d = await r.json();
-    return Array.isArray(d.approved) ? d.approved.map((s) => String(s).toLowerCase()) : [];
-  } catch { return []; }
-}
-async function hasOpenRequest(login) {
-  // pending request = an open issue in the public fuse repo authored by this account
-  try {
-    const q = encodeURIComponent(`repo:${FUSE_REPO} is:issue is:open author:${login} in:title "${REQ_TITLE.trim()}"`);
-    const r = await fetch(`${API}/search/issues?q=${q}`, { headers: ghHeaders() });
-    if (!r.ok) return false;
-    const d = await r.json();
-    return d.total_count > 0;
-  } catch { return false; }
-}
-async function resolveRole() {
-  if (!me) { myRole = "guest"; return; }
-  if (me.login === OWNER_LOGIN) { myRole = "owner"; return; }
-  if (helperAvailable()) {
-    try { myRole = (await helper("me", { token })).role || "none"; return; } catch { /* fall through to GitHub-native */ }
-  }
-  if ((await approvedList()).includes(me.login.toLowerCase())) { myRole = "approved"; return; }
-  myRole = (await hasOpenRequest(me.login)) ? "pending" : "none";
-}
 
 async function api(path, opts = {}, retry = true) {
-  // Approved non-owner accounts reach the private repo through the helper's
-  // whitelisted proxy (installation token server-side). Owner stays direct.
-  if (myRole === "approved" && path.startsWith("/repos/")) return relayApi(path, opts, retry);
   const res = await fetch(`${API}${path}`, {
     ...opts,
     headers: {
@@ -136,27 +115,123 @@ async function api(path, opts = {}, retry = true) {
   return res.status === 204 ? null : res.json();
 }
 
-async function relayApi(path, opts = {}, retry = true) {
-  let bodyObj = null;
-  if (opts.body) { try { bodyObj = JSON.parse(opts.body); } catch { bodyObj = null; } }
+/* ================= tenancy: every user hosts themselves ================= */
+async function checkInstalled() {
   try {
-    const d = await helper("proxy", { token, method: (opts.method || "GET").toUpperCase(), path, body: bodyObj });
-    if (d.status === 204 || d.status === 202) return null;
-    if (d.status >= 400) {
-      const e = new Error((d.body && d.body.message) || `HTTP ${d.status}`);
-      e.status = d.status;
-      throw e;
-    }
-    return typeof d.body === "string" && d.body === "" ? null : d.body;
+    const d = await api("/user/installations?per_page=100");
+    installed = (d.installations || []).some((i) => i.app_id === APP_ID);
+  } catch { installed = false; }
+  return installed;
+}
+async function ensureRepo() {
+  // Does the tenant repo exist?
+  try {
+    await api(`/repos/${full()}`);
   } catch (e) {
-    if (e.status === 401 && retry && localStorage.getItem(RKEY)) {
-      if (await refreshOAuthToken()) return relayApi(path, opts, false);
+    if (e.status !== 404) throw e;
+    // Create it — private, self-hosted, self-billed.
+    await api("/user/repos", {
+      method: "POST",
+      body: JSON.stringify({
+        name: REPO,
+        private: true,
+        auto_init: true,
+        description: "Sovereign workstation — provisioned by the FUSE console (fusedispatch.github.io)",
+      }),
+    });
+    await waitRepo();
+  }
+  await ensureFiles();
+  repoReady = true;
+}
+async function waitRepo() { // auto_init takes a moment before contents PUTs work
+  for (let i = 0; i < 10; i++) {
+    try { await api(`/repos/${full()}`); return; } catch { /* not yet */ }
+    await new Promise((r) => setTimeout(r, 700));
+  }
+  throw new Error("repo did not become available in time");
+}
+function b64(str) {
+  const b = new TextEncoder().encode(str);
+  let s = "";
+  for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode(...b.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+async function ensureFiles() {
+  for (const f of TEMPLATE_FILES) {
+    let sha = null;
+    try {
+      const cur = await api(`/repos/${full()}/contents/${f.dest}`);
+      sha = cur.sha;
+      if (!f.overwrite) continue; // already there — keep the user's version
+    } catch (e) {
+      if (e.status !== 404) throw e; // 404 = file missing → create below
     }
-    throw e;
+    const src = await fetch(`${f.src}?v=${Date.now()}`, { cache: "no-store" });
+    if (!src.ok) throw new Error(`template ${f.src} unavailable (${src.status})`);
+    const body = { message: `FUSE: ${sha ? "update" : "add"} ${f.dest}`, content: b64(await src.text()), branch: "main" };
+    if (sha) body.sha = sha;
+    await api(`/repos/${full()}/contents/${f.dest}`, { method: "PUT", body: JSON.stringify(body) });
   }
 }
-async function relayRaw(path) { // for job logs / the artifact zip (returns {status, ...})
-  return helper("proxy", { token, method: "GET", path });
+async function checkTsKey() {
+  try { await api(`/repos/${full()}/actions/secrets/TS_AUTHKEY`); tsKeySet = true; }
+  catch { tsKeySet = false; }
+}
+async function setTsKey() {
+  const input = $("ts-key-input");
+  const key = input.value.trim();
+  const btn = $("ts-key-set");
+  if (!key) { toast("Paste a Tailscale auth key first.", "err"); return; }
+  if (!/^tskey-/.test(key)) {
+    toast("That doesn't look like a Tailscale key — they start with tskey-.", "err");
+    return;
+  }
+  btn.disabled = true; btn.classList.add("loading");
+  try {
+    // Seal the key for both secret stores through the exchange helper
+    // (libsodium sealed box) — the raw key never crosses the helper.
+    const ak = await api(`/repos/${full()}/actions/secrets/public-key`);
+    const ck = await api(`/repos/${full()}/codespaces/secrets/public-key`);
+    const [a, c] = await Promise.all([
+      helper("seal", { public_key: ak.key, secret: key }),
+      helper("seal", { public_key: ck.key, secret: key }),
+    ]);
+    await api(`/repos/${full()}/actions/secrets/TS_AUTHKEY`, {
+      method: "PUT",
+      body: JSON.stringify({ encrypted_value: a.encrypted_value, key_id: ak.key_id }),
+    });
+    await api(`/repos/${full()}/codespaces/secrets/TS_AUTHKEY`, {
+      method: "PUT",
+      body: JSON.stringify({ encrypted_value: c.encrypted_value, key_id: ck.key_id }),
+    });
+    tsKeySet = true;
+    input.value = "";
+    renderSetup();
+    toast("Tailscale key sealed into your repo secrets (Actions + Codespaces).");
+  } catch (err) {
+    toast(`Setting the key failed (${err.status || "network"}): ${err.message}`, "err");
+  } finally {
+    btn.disabled = false; btn.classList.remove("loading");
+  }
+}
+async function tenantInit(silent = true) {
+  renderSetup();
+  try {
+    await checkInstalled();
+    if (!installed) { renderSetup(); return; }
+    await ensureRepo();
+    await checkTsKey();
+    renderSetup();
+    // A brand-new workflow takes a few seconds to be indexed for dispatch
+    // — prewarm with a harmless workflow listing.
+    try { await api(`/repos/${full()}/actions/workflows`); } catch { /* non-fatal */ }
+    refreshAll();
+    startPolling();
+  } catch (e) {
+    renderSetup(e);
+    if (!silent) toast(`Setup error: ${e.message}`, "err");
+  }
 }
 
 /* ================= UI helpers ================= */
@@ -175,7 +250,7 @@ function lockedHTML(what) {
   return `<div class="locked">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
       <rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
-    <p>Sign in to ${what}.</p>
+    <p>Sign in to ${what} — each account hosts its own workstations.</p>
     <button class="btn primary sm" data-open-login>Sign in</button>
   </div>`;
 }
@@ -206,7 +281,6 @@ function genPassword(len = 16) {
   const arr = new Uint32Array(len - pw.length);
   crypto.getRandomValues(arr);
   for (const n of arr) pw.push(all[n % all.length]);
-  // Fisher-Yates shuffle with crypto randomness
   const sh = new Uint32Array(pw.length);
   crypto.getRandomValues(sh);
   for (let i = pw.length - 1; i > 0; i--) {
@@ -215,6 +289,7 @@ function genPassword(len = 16) {
   }
   return pw.join("");
 }
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 /* ================= auth ================= */
 function openLogin() {
@@ -233,9 +308,8 @@ async function doLogin() {
     me = await api("/user");
     localStorage.setItem(KEY, t);
     closeModal("login-modal");
-    await resolveRole();
     finishSignIn();
-    toast(`Signed in as ${me.login} — console unlocked.`);
+    toast(`Signed in as ${me.login} — workstations will run on your own account.`);
   } catch (e) {
     token = save;
     $("login-error").textContent =
@@ -250,33 +324,26 @@ async function doLogin() {
 function logout() {
   localStorage.removeItem(KEY);
   localStorage.removeItem(RKEY);
-  token = ""; me = null; myRole = "guest"; activeInfo = null; logCache = {};
-  $("access-card").hidden = true;
+  token = ""; me = null; installed = false; repoReady = false; tsKeySet = false; activeInfo = null; logCache = {};
   clearInterval(timer); timer = null;
   renderAuthArea();
   renderLocks();
+  renderSetup();
   toast("Signed out. Credentials cleared from this browser.");
 }
 function finishSignIn() {
   renderAuthArea();
   renderLocks();
-  if (myRole === "owner" || (myRole === "approved" && helperAvailable())) {
-    $("ws-body").innerHTML = skeletons(4);
-    $("cs-body").innerHTML = skeletons(2);
-    if (myRole === "owner") {
-      $("billing-body").innerHTML = skeletons(3);
-      loadRequests();
-    }
-    refreshAll();
-    startPolling();
-  }
+  $("ws-body").innerHTML = skeletons(4);
+  $("cs-body").innerHTML = skeletons(2);
+  tenantInit();
 }
 function renderAuthArea() {
   const a = $("auth-area");
   if (me) {
     a.innerHTML = `
-      <div class="status-pill" title="sovereign-workstation · private repo"><span class="dot ok"></span> connected · <b>${me.login}</b></div>
-      <img class="avatar" src="${me.avatar_url}" alt="" title="${me.login}">
+      <div class="status-pill" title="${esc(me.login)}/${REPO} · your own private repo"><span class="dot ok"></span> tenant · <b>${esc(me.login)}</b></div>
+      <img class="avatar" src="${me.avatar_url}" alt="" title="${esc(me.login)}">
       <button id="logout-btn" class="btn ghost sm">Sign out</button>`;
     $("logout-btn").addEventListener("click", logout);
   } else {
@@ -286,71 +353,78 @@ function renderAuthArea() {
     $("open-login").addEventListener("click", openLogin);
   }
 }
-const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-function requestHTML(what) {
-  return `<div class="locked">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
-      <circle cx="12" cy="12" r="9"/><path d="M10 12h4M12 8v8"/></svg>
-    <p>Signed in as <b>${esc(me ? me.login : "")}</b>, but this account isn't approved to ${what}.</p>
-    <button class="btn primary sm" data-request-access>Request access</button>
-  </div>`;
-}
-function relayNeededHTML(what) {
-  return `<div class="locked">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
-      <circle cx="12" cy="12" r="9"/><path d="M8 12h8"/></svg>
-    <p><b>${esc(me ? me.login : "")}</b> is approved — but live console actions (${what}) need the access relay to be enabled by <b>${esc(OWNER_LOGIN)}</b>.</p>
-  </div>`;
-}
-function pendingHTML(what) {
-  return `<div class="locked">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
-      <circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
-    <p>Access request pending — you'll be able to ${what} as soon as <b>${esc(OWNER_LOGIN)}</b> approves this account.</p>
-  </div>`;
-}
-function bindRequestButtons(root) {
-  root.querySelectorAll("[data-request-access]").forEach((b) => b.addEventListener("click", requestAccess));
-}
-function renderRequestStrip() {
-  const strip = $("request-strip");
-  if (!me || myRole === "owner" || myRole === "approved") { strip.hidden = true; return; }
-  strip.hidden = false;
-  if (myRole === "pending") {
-    $("request-msg").textContent = `Access request pending for ${me.login} — the console unlocks here as soon as it's approved.`;
-    $("request-btn").hidden = true;
-  } else {
-    $("request-msg").textContent = `Signed in as ${me.login} — this console is for approved accounts.`;
-    $("request-btn").hidden = false;
-  }
-}
+
 function renderLocks() {
-  const authed = me && (myRole === "owner" || myRole === "approved");
-  const authedFull = authed && (myRole !== "approved" || helperAvailable());
-  $("guest-strip").hidden = !!me;
-  renderRequestStrip();
-  $("lock-dispatch").hidden = authedFull;
-  $("bill-nav").hidden = myRole !== "owner";
-  $("billing-card").hidden = myRole !== "owner";
-  $("access-card").hidden = myRole !== "owner";
-  $("cs-create-btn").hidden = !authedFull;
-  const bodies = {
-    "cs-body": "manage codespace exit nodes",
-    "ws-body": "see running workstations, stats and RDP access",
-  };
+  const authed = !!me;
+  $("guest-strip").hidden = authed;
+  $("lock-dispatch").hidden = authed;
+  $("billing-card").hidden = !authed;
+  $("bill-nav").hidden = !authed;
+  $("cs-create-btn").hidden = !authed;
+  const bodies = { "cs-body": "manage codespace exit nodes", "ws-body": "see running workstations, stats and RDP access" };
   for (const [id, what] of Object.entries(bodies)) {
-    if (!authedFull) {
-      $(id).innerHTML = !me ? lockedHTML(what)
-        : (myRole === "approved" ? relayNeededHTML(what)
-        : (myRole === "pending" ? pendingHTML(what) : requestHTML(what)));
+    if (!authed) {
+      $(id).innerHTML = lockedHTML(what);
       bindLoginButtons($(id));
-      bindRequestButtons($(id));
     }
   }
 }
 function startPolling() {
   clearInterval(timer);
   timer = setInterval(refreshAll, 15000);
+}
+
+/* ================= setup card (tenant bootstrap state) ================= */
+function setupRow(ok, busy, title, detail, action) {
+  const icon = busy ? `<span class="spin"></span>`
+    : ok ? `<span class="dot ok"></span>`
+    : `<span class="dot"></span>`;
+  return `<div class="setup-row">
+    <div class="setup-ic">${icon}</div>
+    <div class="setup-tx"><b>${title}</b><span>${detail}</span></div>
+    <div class="setup-ac">${action || ""}</div>
+  </div>`;
+}
+function renderSetup(err) {
+  const card = $("setup-card");
+  if (!me) { card.hidden = true; return; }
+  card.hidden = false;
+  const body = $("setup-body");
+  const appRow = installed
+    ? setupRow(true, false, "FUSE Console app installed", "granted on your account — no repo access beyond what's needed", "")
+    : setupRow(false, false, "Install the FUSE Console app",
+        `one click — the console provisions your workstation repo through it`,
+        `<a class="btn primary sm" href="${INSTALL_URL}" target="_blank" rel="noopener">Install ↗</a>`);
+  let repoRow, keyRow;
+  if (!installed) {
+    repoRow = setupRow(false, false, "Workstation repo", "waiting for the app install", "");
+    keyRow = setupRow(false, false, "Tailscale key secret", "waiting for the app install", "");
+  } else if (err) {
+    repoRow = setupRow(false, false, "Workstation repo", `<span class="error">${esc(err.message)}</span>`,
+      `<button class="btn ghost sm" id="setup-retry">Retry</button>`);
+    keyRow = setupRow(false, false, "Tailscale key secret", "blocked by the error above", "");
+  } else {
+    repoRow = repoReady
+      ? setupRow(true, false, `Workstation repo ready`, `<span class="mono">${esc(full())}</span> — private, in your account · workflow v4.4.0`,
+          `<a class="btn ghost sm" href="https://github.com/${esc(full())}" target="_blank" rel="noopener">open ↗</a>`)
+      : setupRow(false, true, "Creating your workstation repo", `cloning the sovereign-workstation template into your account`, "");
+    keyRow = tsKeySet
+      ? setupRow(true, false, "Tailscale key secret set", "TS_AUTHKEY (Actions + Codespaces) — sealed, never sent raw",
+          `<button class="btn ghost sm" id="ts-key-change">Replace</button>`)
+      : setupRow(false, false, "Set your Tailscale auth key",
+          `reusable + ephemeral key · <a href="https://login.tailscale.com/admin/settings/keys" target="_blank" rel="noopener">admin → Settings → Keys ↗</a>`,
+          `<div class="row setup-keyrow"><input id="ts-key-input" type="password" placeholder="tskey-…" autocomplete="off" spellcheck="false"><button class="btn primary sm" id="ts-key-set">Set</button></div>`);
+  }
+  body.innerHTML = appRow + repoRow + keyRow +
+    `<p class="fineprint">Everything runs in your own repo, under your own GitHub account — Actions minutes and Codespaces bill to you, and your token never leaves this browser.</p>`;
+  const retry = $("setup-retry");
+  if (retry) retry.addEventListener("click", () => tenantInit(false));
+  const setBtn = $("ts-key-set");
+  if (setBtn) setBtn.addEventListener("click", setTsKey);
+  const keyIn = $("ts-key-input");
+  if (keyIn) keyIn.addEventListener("keydown", (e) => { if (e.key === "Enter") setTsKey(); });
+  const chg = $("ts-key-change");
+  if (chg) chg.addEventListener("click", () => { tsKeySet = false; renderSetup(); });
 }
 
 /* ================= GitHub account (OAuth) ================= */
@@ -410,9 +484,8 @@ async function completeOAuth() {
     localStorage.setItem(KEY, token);
     if (data.refresh_token) localStorage.setItem(RKEY, data.refresh_token);
     me = await api("/user");
-    await resolveRole();
     finishSignIn();
-    toast(`Welcome back, ${me.login} — signed in with GitHub.`);
+    toast(`Welcome, ${me.login} — workstations will run on your own account.`);
     return true;
   } catch (e) {
     token = "";
@@ -425,6 +498,11 @@ async function completeOAuth() {
 async function dispatch(e) {
   e.preventDefault();
   if (!me) { openLogin(); return; }
+  if (!repoReady || !tsKeySet) {
+    toast("Finish the two setup steps above first (repo + Tailscale key).", "err");
+    $("setup-card").scrollIntoView({ behavior: "smooth" });
+    return;
+  }
   const btn = $("dispatch-btn");
   const msg = $("dispatch-msg");
   msg.textContent = ""; msg.className = "";
@@ -437,24 +515,26 @@ async function dispatch(e) {
   }
   btn.disabled = true; btn.classList.add("loading");
   try {
-    await api(`/repos/${OWNER}/${REPO}/actions/workflows/${WF}/dispatches`, {
+    await api(`/repos/${full()}/actions/workflows/${WF}/dispatches`, {
       method: "POST",
       body: JSON.stringify({
         ref: "main",
         inputs: {
-          tailscale_key: $("ts-key").value.trim(),
+          tailscale_key: "", // blank → the workflow falls back to your TS_AUTHKEY secret
           duration_minutes: $("duration").value,
           warning_minutes: $("warning").value,
           rdp_username: $("rdp-user").value.trim(),
-          rdp_password: $("rdp-pass").value,
+          rdp_password: pw,
           rdp_port: $("rdp-port").value.trim(),
           enable_auto_shutdown: $("auto-shutdown").checked,
+          enable_audit_log: true,
         },
       }),
     });
     msg.textContent = "Dispatched — ignition.";
     msg.className = "ok";
     toast("Workstation dispatched — ignition. Watch Workstations below.");
+    logCache = {};
     loadWorkstations();
   } catch (err) {
     msg.textContent = `Failed (${err.status}): ${err.message}`;
@@ -496,18 +576,19 @@ function parseConnInfo(log) {
   };
 }
 async function fetchJobLog(run) {
-  const jobs = await api(`/repos/${OWNER}/${REPO}/actions/runs/${run.id}/jobs`);
+  const jobs = await api(`/repos/${full()}/actions/runs/${run.id}/jobs`);
   const job = (jobs.jobs || []).find((j) => j.name.includes("Provision")) || (jobs.jobs || [])[0];
   if (!job) throw new Error("no jobs found on this run");
-  if (myRole === "approved") {
-    const d = await relayRaw(`/repos/${OWNER}/${REPO}/actions/jobs/${job.id}/logs`);
-    if (d.status >= 400) throw new Error(`job log HTTP ${d.status}`);
-    return typeof d.body === "string" ? d.body : JSON.stringify(d.body);
-  }
-  const res = await fetch(`${API}/repos/${OWNER}/${REPO}/actions/jobs/${job.id}/logs`, {
+  const res = await fetch(`${API}/repos/${full()}/actions/jobs/${job.id}/logs`, {
     headers: { Authorization: `Bearer ${token}`, "X-GitHub-Api-Version": "2022-11-28" },
   });
   return await res.text();
+}
+function minutesLeft(run, info) {
+  if (!info || !info.duration) return null;
+  const elapsed = (Date.now() - new Date(run.created_at)) / 60000;
+  const left = Math.round(+info.duration - elapsed);
+  return left > 0 ? left : 0;
 }
 function activeVMCard(run, info) {
   if (!run) {
@@ -517,6 +598,16 @@ function activeVMCard(run, info) {
     </div>`;
   }
   const pending = !info || (!info.tsIp && !info.rdpUser);
+  const left = minutesLeft(run, info);
+  const steps = [
+    { n: "Create", on: true },
+    { n: "Ready", on: !!info },
+    { n: "Connect", on: !!info },
+    { n: "Countdown", on: left !== null },
+    { n: "Shutdown", on: false },
+    { n: "Cleanup", on: false },
+  ];
+  const stepper = `<div class="lifecycle">${steps.map((s) => `<span class="l-step${s.on ? " on" : ""}">${s.n}</span><span class="l-sep"></span>`).join("").replace(/<span class="l-sep"><\/span>$/, "")}</div>`;
   const f = (id, label, val, cls = "") => val
     ? `<div class="field ${cls}"><span class="f-label">${label}</span>
          <span class="f-val mono" id="${id}-text">${val}</span>
@@ -528,10 +619,11 @@ function activeVMCard(run, info) {
     <div class="vm-head">
       <span class="badge in_progress">running</span>
       <div class="vm-title">Workstation #${run.run_number}
-        <span class="vm-sub mono">run ${run.id} · started ${ago(run.created_at)}${info && info.duration ? ` · session ${info.duration} min` : ""}${info && info.warning ? ` · warns at ${info.warning}` : ""}${info && info.autoShutdown ? ` · auto-shutdown on` : ""}</span>
+        <span class="vm-sub mono">run ${run.id} · started ${ago(run.created_at)}${info && info.duration ? ` · session ${info.duration} min` : ""}${info && info.autoShutdown && left !== null ? ` · auto-shutdown in ~${left} min` : ""}${info && info.warning ? ` · warns at ${info.warning}` : ""}</span>
       </div>
       <a href="${run.html_url}" target="_blank" rel="noopener">open ↗</a>
     </div>
+    ${stepper}
     ${pending
       ? `<p class="muted vm-pending"><span class="spin"></span> Provisioning — Tailscale IP and RDP details appear here as soon as the workstation is up (this refreshes automatically).</p>`
       : `<div class="vm-fields">
@@ -551,27 +643,32 @@ function activeVMCard(run, info) {
           <div class="btn-row">
             <button class="btn primary sm" id="rdp-download">Download .rdp file</button>
             <button class="btn ghost sm" data-run-info="${run.id}">Full connection info</button>
+            <button class="btn danger sm" data-run-stop="${run.id}">Shut down now</button>
           </div>
-          <p class="fineprint">Connect from any device on your tailnet — Windows Remote Desktop (mstsc), or an RDP client that accepts the .rdp file.</p>
+          <p class="fineprint">Connect from any device on your tailnet — Windows Remote Desktop (mstsc), or an RDP client that accepts the .rdp file.${info.autoShutdown ? ` Auto-shutdown ${left !== null ? `in ~${left} min` : "on expiry"} — the workflow cleans up after itself.` : ""}</p>
         </div>`}
   </div>`;
 }
 function deadVMRow(run) {
   const ok = run.conclusion === "success";
+  const label = ok ? "ended" : (run.conclusion === "cancelled" ? "shut down" : (run.conclusion || "?"));
   return `
   <div class="run">
-    <span class="badge ${ok ? "success" : "failure"}">${ok ? "ended" : run.conclusion || "?"}</span>
+    <span class="badge ${ok ? "success" : "failure"}">${label}</span>
     <div class="meta">#${run.run_number} · ${ago(run.created_at)}
       <div class="sub">run ${run.id} · dead VM — session closed</div>
     </div>
-    <a href="${run.html_url}" target="_blank" rel="noopener">open ↗</a>
+    <div class="run-actions">
+      <a href="${run.html_url}" target="_blank" rel="noopener">open ↗</a>
+      <button class="btn ghost sm" data-run-clean="${run.id}">Clean up</button>
+    </div>
   </div>`;
 }
 async function loadWorkstations() {
-  if (!me) return;
+  if (!me || !repoReady) return;
   const wrap = $("ws-body");
   try {
-    const data = await api(`/repos/${OWNER}/${REPO}/actions/workflows/${WF}/runs?per_page=8`);
+    const data = await api(`/repos/${full()}/actions/workflows/${WF}/runs?per_page=8`);
     const runs = data.workflow_runs || [];
     const active = runs.filter((r) => r.status !== "completed");
     const dead = runs.filter((r) => r.status === "completed");
@@ -641,18 +738,11 @@ async function unzipFirstText(buf, needle) {
   throw new Error("entry not found in zip");
 }
 async function fetchArtifactInfo(run) {
-  const arts = await api(`/repos/${OWNER}/${REPO}/actions/artifacts?per_page=20`);
+  const arts = await api(`/repos/${full()}/actions/artifacts?per_page=20`);
   const art = (arts.artifacts || []).find(
     (a) => a.workflow_run && a.workflow_run.id === run.id && a.name === "connection-info" && !a.expired);
   if (!art) return null;
-  if (myRole === "approved") {
-    const d = await relayRaw(`/repos/${OWNER}/${REPO}/actions/artifacts/${art.id}/zip`);
-    if (d.status >= 400) throw new Error(`artifact zip HTTP ${d.status}`);
-    const bin = Uint8Array.from(atob(d.body_b64), (c) => c.charCodeAt(0));
-    const txt = await unzipFirstText(bin.buffer, "connection-info");
-    return { info: parseArtifactInfo(txt), raw: txt };
-  }
-  const res = await fetch(`${API}/repos/${OWNER}/${REPO}/actions/artifacts/${art.id}/zip`, {
+  const res = await fetch(`${API}/repos/${full()}/actions/artifacts/${art.id}/zip`, {
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
   });
   if (!res.ok) throw new Error(`artifact zip HTTP ${res.status}`);
@@ -681,7 +771,6 @@ async function fetchActiveInfo(run) {
   if (!info) return;
   logCache[run.id] = { ts: Date.now(), info, raw };
   activeInfo = info;
-  // re-render just the active card if fields changed
   const wrap = $("ws-body");
   const cur = wrap.querySelector(".vm-card");
   if (cur && (cached ? JSON.stringify(cached.info) !== JSON.stringify(info) : true)) {
@@ -699,8 +788,34 @@ function bindVmEvents(wrap) {
   });
   wrap.querySelectorAll("[data-run-info]").forEach((b) =>
     b.addEventListener("click", () => showConnectionInfo(b.dataset.runInfo, b)));
+  wrap.querySelectorAll("[data-run-stop]").forEach((b) =>
+    b.addEventListener("click", () => shutdownRun(b.dataset.runStop, b)));
+  wrap.querySelectorAll("[data-run-clean]").forEach((b) =>
+    b.addEventListener("click", () => cleanupRun(b.dataset.runClean, b)));
   const dl = $("rdp-download");
   if (dl) dl.addEventListener("click", downloadRdp);
+}
+async function shutdownRun(runId, btn) {
+  if (!confirm("Shut the workstation down now? The workflow's cleanup (Tailscale logout, session teardown) still runs.")) return;
+  btn.disabled = true;
+  try {
+    await api(`/repos/${full()}/actions/runs/${runId}/cancel`, { method: "POST" });
+    toast("Shutdown requested — cleanup runs automatically.");
+  } catch (err) {
+    toast(`Shutdown failed: ${err.message}`, "err");
+    btn.disabled = false;
+  }
+}
+async function cleanupRun(runId, btn) {
+  btn.disabled = true;
+  try {
+    await api(`/repos/${full()}/actions/runs/${runId}`, { method: "DELETE" });
+    toast("Run cleaned up — logs and artifacts deleted.");
+    loadWorkstations();
+  } catch (err) {
+    toast(`Cleanup failed: ${err.message}`, "err");
+    btn.disabled = false;
+  }
 }
 function downloadRdp() {
   const info = activeInfo;
@@ -727,17 +842,21 @@ function downloadRdp() {
 /* raw connection info modal */
 async function showConnectionInfo(runId, btn) {
   if (btn) btn.disabled = true;
-  $("conn-body").textContent = "Fetching logs…";
+  $("conn-body").textContent = "Fetching connection info…";
   openModal("conn-modal");
   try {
-    const run = { id: runId };
     let log = (logCache[runId] || {}).raw;
     if (!log) {
-      log = await fetchJobLog(run);
+      const runWrap = { id: runId };
+      const a = await fetchArtifactInfo(runWrap).catch(() => null);
+      if (a) { log = a.raw; logCache[runId] = { ts: Date.now(), info: a.info, raw: a.raw }; }
+    }
+    if (!log) {
+      log = await fetchJobLog({ id: runId });
       logCache[runId] = { ts: Date.now(), info: parseConnInfo(log), raw: log };
     }
     if (/^session_id=/m.test(log)) {
-      // artifact text — clean key=value lines, render as-is
+      // artifact text — render as-is
       $("conn-body").textContent = log.trim();
       return;
     }
@@ -747,7 +866,7 @@ async function showConnectionInfo(runId, btn) {
     $("conn-body").textContent = out || "(no connection lines found in log — check the run on GitHub)";
   } catch (err) {
     $("conn-body").textContent = `Failed to load connection info (${err.status || ""}): ${err.message}\n\n` +
-      `Open the run on GitHub and read the "Display Connection Information" step:\nhttps://github.com/${OWNER}/${REPO}/actions/runs/${runId}`;
+      `Open the run on GitHub and read the "Display Connection Information" step:\nhttps://github.com/${full()}/actions/runs/${runId}`;
   } finally {
     if (btn) btn.disabled = false;
   }
@@ -758,7 +877,7 @@ async function createCodespace() {
   const btn = $("cs-create-btn");
   btn.disabled = true; btn.classList.add("loading");
   try {
-    const cs = await api(`/repos/${OWNER}/${REPO}/codespaces`, {
+    const cs = await api(`/repos/${full()}/codespaces`, {
       method: "POST",
       body: JSON.stringify({ ref: "main" }),
     });
@@ -771,17 +890,17 @@ async function createCodespace() {
   }
 }
 async function loadCodespaces() {
-  if (!me) return;
+  if (!me || !repoReady) return;
   const wrap = $("cs-body");
   try {
-    const data = await api(`/repos/${OWNER}/${REPO}/codespaces?per_page=10`);
+    const data = await api(`/repos/${full()}/codespaces?per_page=10`);
     const list = data.codespaces || [];
     if (!list.length) { wrap.innerHTML = `<p class="muted" style="padding:10px 2px">No codespaces running.</p>`; return; }
     wrap.innerHTML = list.map((c) => `
       <div class="run">
         <span class="badge ${c.state === "Available" ? "success" : "in_progress"}">${c.state}</span>
-        <div class="meta">${c.name}
-          <div class="sub">${(c.machine && c.machine.display_name) || ""} · created ${ago(c.created_at)}</div>
+        <div class="meta">${esc(c.name)}
+          <div class="sub">${esc((c.machine && c.machine.display_name) || "")} · created ${ago(c.created_at)}</div>
         </div>
         <button class="btn danger sm" data-cs-del="${c.id}">Delete</button>
       </div>`).join("");
@@ -789,10 +908,7 @@ async function loadCodespaces() {
       b.addEventListener("click", async () => {
         b.disabled = true;
         try {
-          const delPath = myRole === "approved"
-            ? `/repos/${OWNER}/${REPO}/codespaces/${b.dataset.csDel}`
-            : `/user/codespaces/${b.dataset.csDel}`;
-          await api(delPath, { method: "DELETE" });
+          await api(`/user/codespaces/${b.dataset.csDel}`, { method: "DELETE" });
           toast("Codespace deleted — node removed from the tailnet.");
         } catch (err) { toast(`Delete failed: ${err.message}`, "err"); }
         loadCodespaces();
@@ -843,7 +959,7 @@ async function loadBilling() {
     renderBilling({ actionsMin, csCoreHrs, csGbHrs, gross, discount, net, perDay, y, m });
   } catch (err) {
     body.innerHTML = `<p class="error">Billing unavailable (${err.status || "network"}): ${err.message}.</p>
-      <p class="muted">Billing endpoints need a personal access token — fine-grained PAT: account permission <code>Plans: Read</code>; classic PAT: <code>user</code> scope. GitHub App sign-in tokens cannot read billing.</p>`;
+      <p class="muted">Billing endpoints need a personal access token — fine-grained PAT: account permission <code>Billing: read-only</code>; classic PAT: <code>user</code> scope. GitHub App sign-in tokens cannot read billing. Everything else in the console works without it.</p>`;
   }
 }
 function metricBar(label, used, limit, unit, decimals = 0) {
@@ -910,151 +1026,12 @@ function toggleLimitsForm() {
   } else f.classList.add("hidden");
 }
 
-/* ================= access control (multi-account) ================= */
-async function requestAccess() {
-  if (!helperAvailable()) {
-    // GitHub-native: file the request as an issue on the public fuse repo.
-    const title = `${REQ_TITLE}${me.login}`;
-    try {
-      await api(`/repos/${FUSE_REPO}/issues`, {
-        method: "POST",
-        body: JSON.stringify({ title, body: `Access request filed from the FUSE console.\n\n- Login: ${me.login}\n- Requested: ${new Date().toISOString()}` }),
-      });
-      myRole = "pending";
-      renderLocks();
-      toast("Request filed — the console unlocks here once approved.", "ok");
-    } catch (e) {
-      // token lacks issue rights: hand them a prefilled issue instead (any GitHub account can submit it)
-      window.open(`https://github.com/${FUSE_REPO}/issues/new?title=${encodeURIComponent(title)}`, "_blank", "noopener");
-      toast("Opened a prefilled issue on GitHub — hit Submit there to send your request.", "ok");
-    }
-    return;
-  }
-  try {
-    const d = await helper("request_access", { token });
-    myRole = d.role || "pending";
-    renderLocks();
-    toast(myRole === "pending" ? "Request sent — the console unlocks here as soon as it's approved."
-        : myRole === "approved" ? "You're already approved — the console is unlocked."
-        : "Request registered.", "ok");
-  } catch (e) { toast(`Request failed: ${e.message}`, "err"); }
-}
-async function ghApprove(login) {
-  // commit the login into approved.json (static, public, Pages-served)
-  let cur = { approved: [] }, sha = null;
-  const g = await fetch(`${API}/repos/${FUSE_REPO}/contents/approved.json`, { headers: ghHeaders() });
-  if (g.ok) {
-    const f = await g.json();
-    sha = f.sha;
-    try { cur = JSON.parse(atob(f.content.replace(/\n/g, ""))); } catch { cur = { approved: [] }; }
-  }
-  const list = Array.isArray(cur.approved) ? cur.approved : [];
-  if (!list.includes(login)) list.push(login);
-  const put = await fetch(`${API}/repos/${FUSE_REPO}/contents/approved.json`, {
-    method: "PUT",
-    headers: ghHeaders({ "Content-Type": "application/json" }),
-    body: JSON.stringify({
-      message: `approve: ${login}`,
-      content: btoa(JSON.stringify({ approved: list }, null, 2)),
-      sha: sha || undefined,
-    }),
-  });
-  if (!put.ok) throw new Error(`approved.json commit failed (${put.status})`);
-}
-async function loadRequests() {
-  if (myRole !== "owner") return;
-  if (!helperAvailable()) return loadRequestsIssues();
-  const wrap = $("access-body");
-  try {
-    const d = await helper("list_requests", { token });
-    const rs = d.requests || [];
-    $("access-count").textContent = rs.length ? `${rs.length} pending` : "none pending";
-    wrap.innerHTML = rs.length ? rs.map((r) => `
-      <div class="run">
-        <img class="avatar sm" src="${esc(r.avatar_url)}" alt="">
-        <div class="meta">${esc(r.login)}
-          <div class="sub">requested ${ago(r.requested_at)}${r.note ? ` · “${esc(r.note)}”` : ""}</div>
-        </div>
-        <button class="btn primary sm" data-approve="${esc(r.login)}">Approve</button>
-        <button class="btn danger sm" data-deny="${esc(r.login)}">Deny</button>
-      </div>`).join("") : `<p class="muted">No pending requests — approved accounts are listed in the helper's KV store.</p>`;
-    wrap.querySelectorAll("[data-approve]").forEach((b) => b.addEventListener("click", () => decide(b.dataset.approve, "approve", b)));
-    wrap.querySelectorAll("[data-deny]").forEach((b) => b.addEventListener("click", () => decide(b.dataset.deny, "deny", b)));
-  } catch (e) {
-    wrap.innerHTML = `<p class="error">Access requests unavailable: ${esc(e.message)}</p>`;
-  }
-}
-async function decide(login, decision, btn) {
-  btn.disabled = true;
-  try {
-    await helper("decide", { token, login, decision });
-    toast(decision === "approve"
-      ? `${login} approved — they can now sign in and use FUSE without repo access.`
-      : `${login} denied.`);
-    loadRequests();
-  } catch (e) {
-    toast(`Failed: ${e.message}`, "err");
-    btn.disabled = false;
-  }
-}
-
-/* ---------- GitHub-native access requests (issues + approved.json, no helper) ---------- */
-function loginFromTitle(title) { return String(title || "").slice(REQ_TITLE.length).trim(); }
-async function loadRequestsIssues() {
-  const wrap = $("access-body");
-  try {
-    const rs = [];
-    let page = 1;
-    while (page <= 3) { // up to 150 open issues scanned
-      const d = await api(`/repos/${FUSE_REPO}/issues?state=open&per_page=50&page=${page++}`);
-      rs.push(...(d || []).filter((i) => !i.pull_request && i.title && i.title.startsWith(REQ_TITLE)));
-      if (!d || d.length < 50) break;
-    }
-    $("access-count").textContent = rs.length ? `${rs.length} pending` : "none pending";
-    wrap.innerHTML = rs.length ? rs.map((r) => `
-      <div class="run">
-        <img class="avatar sm" src="${esc(r.user && r.user.avatar_url)}" alt="">
-        <div class="meta">${esc(loginFromTitle(r.title))}
-          <div class="sub">requested ${ago(r.created_at)} · <a href="${esc(r.html_url)}" target="_blank" rel="noopener">issue #${r.number}</a></div>
-        </div>
-        <button class="btn primary sm" data-approve="${esc(loginFromTitle(r.title))}" data-num="${r.number}">Approve</button>
-        <button class="btn danger sm" data-deny="${esc(loginFromTitle(r.title))}" data-num="${r.number}">Deny</button>
-      </div>`).join("") : `<p class="muted">No pending requests — requests arrive as issues on ${FUSE_REPO}.</p>`;
-    wrap.querySelectorAll("[data-approve]").forEach((b) => b.addEventListener("click", () => decideIssue(b.dataset.approve, b.dataset.num, "approve", b)));
-    wrap.querySelectorAll("[data-deny]").forEach((b) => b.addEventListener("click", () => decideIssue(b.dataset.deny, b.dataset.num, "deny", b)));
-  } catch (e) {
-    wrap.innerHTML = `<p class="error">Access requests unavailable: ${esc(e.message)}</p>`;
-  }
-}
-async function decideIssue(login, num, decision, btn) {
-  btn.disabled = true;
-  try {
-    if (decision === "approve") await ghApprove(login);
-    await api(`/repos/${FUSE_REPO}/issues/${num}`, {
-      method: "PATCH",
-      body: JSON.stringify({ state: "closed" }),
-    });
-    await api(`/repos/${FUSE_REPO}/issues/${num}/comments`, {
-      method: "POST",
-      body: JSON.stringify({ body: decision === "approve"
-        ? `Approved by ${OWNER_LOGIN} — you can now use the FUSE console. Welcome aboard.` 
-        : `Request declined by ${OWNER_LOGIN}.` }),
-    });
-    toast(decision === "approve" ? `${login} approved — approved.json updated, they can use FUSE now.` : `${login} denied.`);
-    loadRequests();
-  } catch (e) {
-    toast(`Failed: ${e.message}`, "err");
-    btn.disabled = false;
-  }
-}
-
 /* ================= refresh & init ================= */
 function refreshAll() {
   if (!me || document.hidden) return;
   loadWorkstations();
   loadCodespaces();
-  if (myRole === "owner") loadRequests();
-  if (!billMonth && myRole === "owner") loadBilling();
+  if (!billMonth) loadBilling();
 }
 
 /* wire up */
@@ -1077,7 +1054,6 @@ $("conn-modal").addEventListener("click", (e) => { if (e.target === $("conn-moda
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") { closeModal("login-modal"); closeModal("conn-modal"); }
 });
-$("request-btn").addEventListener("click", requestAccess);
 $("dispatch-form").addEventListener("submit", dispatch);
 $("cs-create-btn").addEventListener("click", createCodespace);
 $("bill-prev").addEventListener("click", () => shiftMonth(-1));
@@ -1104,7 +1080,6 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden && me
     if (token) {
       try {
         me = await api("/user");
-        await resolveRole();
         finishSignIn();
       } catch (e) {
         token = ""; me = null;

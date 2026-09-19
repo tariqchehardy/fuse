@@ -18,7 +18,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="fuse.css?v=9">
+<link rel="stylesheet" href="fuse.css?v=10">
 </head>
 <body>
 
@@ -34,27 +34,23 @@
 </header>
 
 <div class="guest-strip" id="guest-strip" hidden>
-  You're browsing as a guest — connect your GitHub account to load workstation data.
-</div>
-<div class="guest-strip" id="request-strip" hidden>
-  <span id="request-msg"></span>
-  <button id="request-btn" class="btn primary sm">Request access</button>
+  You're browsing as a guest — sign in with GitHub and FUSE sets up a workstation repo under your own account.
 </div>
 
 <main>
 
-  <!-- ACCESS REQUESTS (owner only) -->
-  <section class="card" id="access-card" hidden>
+  <!-- TENANT SETUP -->
+  <section class="card" id="setup-card" hidden>
     <div class="card-head">
       <div class="card-icon">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="9" cy="8" r="3.5"/><path d="M3 20c0-3 2.7-5 6-5s6 2 6 5"/><circle cx="17.5" cy="9" r="2.5"/><path d="M16.5 15.5c2.7.3 4.5 2 4.5 4.5"/></svg>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M4 12h10M4 17h7"/><path d="M18 14l-2 5h4l-2 5"/></svg>
       </div>
       <div>
-        <h2>Access Requests</h2>
-        <p class="card-sub">Approve GitHub accounts to use FUSE — approved accounts run the console through the app's whitelisted proxy, no repo access needed · <span id="access-count"></span></p>
+        <h2>Your Workstation Environment</h2>
+        <p class="card-sub">One-time setup — FUSE clones the workstation template into a private repo in your own account</p>
       </div>
     </div>
-    <div id="access-body"></div>
+    <div id="setup-body"></div>
   </section>
 
   <!-- DISPATCH -->
@@ -65,7 +61,7 @@
       </div>
       <div>
         <h2>Dispatch Sovereign Workstation</h2>
-        <p class="card-sub">Ephemeral Windows workstation, provisioned through GitHub Actions</p>
+        <p class="card-sub">Ephemeral Windows workstation, provisioned through GitHub Actions — in your own repo</p>
       </div>
     </div>
     <div class="lockcover" id="lock-dispatch" hidden>
@@ -96,9 +92,6 @@
         <input id="rdp-pass" placeholder="generated on load" spellcheck="false" autocomplete="new-password" minlength="8"></label>
       <label>RDP port <input id="rdp-port" value="3389" inputmode="numeric" autocomplete="off"></label>
       <label class="check"><input id="auto-shutdown" type="checkbox" checked> Auto-shutdown on expiry</label>
-      <label class="full">Tailscale auth key <span class="hint">(optional — blank uses the built-in TS_AUTHKEY repo secret)</span>
-        <input id="ts-key" type="password" placeholder="blank = built-in key" autocomplete="off" spellcheck="false">
-      </label>
       <div class="full btn-row">
         <button type="submit" class="btn primary" id="dispatch-btn">Ignite workstation</button>
         <span id="dispatch-msg"></span>
@@ -157,7 +150,7 @@
       <div class="head-split">
         <div>
           <h2>Codespace Exit Nodes</h2>
-          <p class="card-sub">Dedicated ephemeral Tailscale exit nodes — no key pasting</p>
+          <p class="card-sub">Dedicated ephemeral Tailscale exit nodes — auth key flows from your repo secret</p>
         </div>
         <button id="cs-create-btn" class="btn primary sm" hidden>Create exit node</button>
       </div>
@@ -168,7 +161,7 @@
 </main>
 
 <footer>
-  <span>FUSE</span> · static dispatch console · your token never leaves this browser
+  <span>FUSE</span> · tenant dispatch console · workstations run in your own GitHub account
   · <a href="https://github.com/fusedispatch/fusedispatch.github.io" target="_blank" rel="noopener">source</a>
 </footer>
 
@@ -180,7 +173,7 @@
       <button id="login-close" class="icon-btn" aria-label="Close">&#10005;</button>
     </div>
     <div class="modal-pad">
-      <p>Sign in with a GitHub token — FUSE never sees your password. <span id="oauth-avail" class="hidden"><b>Account sign-in</b> appears here once the optional access helper is configured; GitHub blocks password-style sign-in from static sites on its own.</span></p>
+      <p>Sign in with a GitHub token — FUSE never sees your password. <b>Continue with GitHub</b> is the recommended path; the token option is for advanced use.</p>
       <button id="oauth-btn" class="btn primary full-btn gh-btn">
         <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
         Continue with GitHub
@@ -196,11 +189,8 @@
           <button id="login-visibility" class="btn ghost" type="button" title="Show / hide">&#128065;</button>
         </div>
         <button id="login-submit" class="btn primary full-btn">Sign in with token</button>
-        <p class="fineprint">Stored only in this browser's localStorage · sent only to <code>api.github.com</code>.<br>
-          Full console (owner / approved) — needs <code>repo,workflow</code>:
-          <a class="gen-link" href="https://github.com/settings/tokens/new?scopes=repo,workflow,user&description=FUSE%20console" target="_blank" rel="noopener">generate a console token ↗</a><br>
-          Just requesting access — any GitHub account, <code>public_repo</code> only:
-          <a class="gen-link" href="https://github.com/settings/tokens/new?scopes=public_repo&description=FUSE%20access%20request" target="_blank" rel="noopener">generate a request token ↗</a></p>
+        <p class="fineprint">Stored only in this browser's localStorage · sent only to <code>api.github.com</code>. Needs <code>repo,workflow</code> (plus <code>user</code> for billing):
+          <a class="gen-link" href="https://github.com/settings/tokens/new?scopes=repo,workflow,user&description=FUSE%20console" target="_blank" rel="noopener">generate a console token ↗</a></p>
       </div>
       <p id="login-error" class="error hidden"></p>
     </div>
@@ -219,6 +209,6 @@
 </div>
 
 <div id="toasts" aria-live="polite"></div>
-<script src="fuse.js?v=9"></script>
+<script src="fuse.js?v=10"></script>
 </body>
 </html>

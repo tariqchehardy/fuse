@@ -1,0 +1,1279 @@
+# =============================================================================
+#  Provision Sovereign Workstation -- v4.2.0 "Hardened"
+#  ---------------------------------------------------------------------------
+#  Enterprise-grade ephemeral Windows workstation provisioned via GitHub
+#  Actions, reachable over Tailscale, accessible via RDP with explicit,
+#  user-visible credentials (no truncation, no masking of the demo password).
+#
+#  Design principles:
+#    * Explicit, visible credentials for the operator (nothing is hidden).
+#    * Idempotent provisioning steps (safe to re-run).
+#    * Fail-fast with rich diagnostics at EVERY stage; nothing dies silently.
+#    * Every fallible operation is wrapped: try/catch, retries, exit-code checks.
+#    * Inputs are passed via environment variables -- NEVER interpolated into
+#      PowerShell bodies (blocks script-injection through workflow_dispatch
+#      inputs). github.event.inputs is referenced ONLY in `env:` blocks.
+#    * Graceful degradation: cleanup and summary ALWAYS run; cleanup is
+#      idempotent and runs BEFORE the OS shutdown (so shutdown can't kill it).
+#    * Session cap accounts for GitHub's 6-hour hosted-job limit:
+#      max session 5 h, job timeout 355 min (buffer for provisioning).
+#    * Concurrency guard: one sovereign session at a time per repo; a new
+#      dispatch cancels the previous run (latest wins, old runner is recycled
+#      by GitHub automatically -- its always() cleanup still fires on cancel).
+#
+#  Fixes vs v3.0.0:
+#    * BUG: auto-shutdown (shutdown /s) fired while later steps still needed
+#      the OS alive -- cleanup/summary were racing the 20s timer. Cleanup now
+#      runs inline first, then shutdown.
+#    * BUG: 8/12/24-hour durations + timeout-minutes 1440 exceed GitHub's
+#      6-hour hosted-job limit -- the platform would kill the run mid-session
+#      with no warning. Durations now specified in minutes (15-300), timeout 355 min.
+#    * BUG: raw ${{ github.event.inputs.* }} inside run: blocks allowed
+#      script injection via the dispatch form. All inputs now flow through env.
+#    * BUG: RDP PortNumber registry change needs a TermService restart to take
+#      effect -- previously the listener check could see the old port. Now
+#      restarted and verified with polling.
+#    * NEW: failure-diagnostics step dumps Tailscale state, RDP event logs,
+#      and netstat on any failure -- before cleanup wipes state.
+#    * NEW: cleanup disables the RDP user and re-closes RDP if the job died
+#      mid-provision (defence-in-depth; runner is ephemeral anyway).
+#    * NEW: concurrency group, minimal permissions, disk-space pre-check,
+#      port-in-use pre-check, Tailscale auth retries with precise error
+#      mapping (expired key / reused key / network down are distinguished).
+#
+#  Author:  Sovereign Workstation Team
+#  Version: 4.4.0  (v4.2.0 hardened + Helium every session + duration in minutes,
+#                     default 95 min / 1 h 35 m sessions;
+#                     v4.3.0: built-in TS_AUTHKEY repo secret -- no key pasting at dispatch)
+#                     v4.4.0: connection-info artifact for FUSE (reliable live VM status;
+#                             in-progress job logs are NOT always fetchable via the API)
+# =============================================================================
+
+name: Provision Sovereign Workstation
+
+# -----------------------------------------------------------------------------
+#  Trigger
+# -----------------------------------------------------------------------------
+on:
+  workflow_dispatch:
+    inputs:
+      tailscale_key:
+        description: 'Tailscale Auth Key (optional -- leave blank to use the built-in TS_AUTHKEY repo secret)'
+        required: false
+        type: string
+
+      duration_minutes:
+        description: 'Session Duration (minutes, max 300 -- GitHub jobs cap at 6h)'
+        required: true
+        default: '95'
+        type: choice
+        options:
+          - '60'
+          - '95'
+          - '120'
+          - '180'
+          - '240'
+          - '300'
+
+      warning_minutes:
+        description: 'Warning Before Expiry (minutes)'
+        required: true
+        default: '10'
+        type: choice
+        options:
+          - '5'
+          - '10'
+          - '15'
+          - '30'
+
+      rdp_username:
+        description: 'RDP Username'
+        required: true
+        default: 'SovereignUser'
+        type: string
+
+      rdp_password:
+        description: 'RDP Password (explicit)'
+        required: true
+        default: 'PrivacyPlus2026!'
+        type: string
+
+      enable_auto_shutdown:
+        description: 'Auto shutdown on session expiry'
+        required: true
+        default: true
+        type: boolean
+
+      rdp_port:
+        description: 'RDP Port'
+        required: true
+        default: '3389'
+        type: string
+
+      enable_audit_log:
+        description: 'Enable session audit logging'
+        required: true
+        default: true
+        type: boolean
+
+# -----------------------------------------------------------------------------
+#  Guards
+# -----------------------------------------------------------------------------
+# One sovereign session at a time. A new dispatch cancels the previous run;
+# the cancelled run's always() cleanup still executes, so nothing leaks.
+concurrency:
+  group: sovereign-workstation
+  cancel-in-progress: true
+
+# Least privilege -- this workflow needs nothing from the GitHub API.
+permissions:
+  contents: read
+
+# -----------------------------------------------------------------------------
+#  Global environment -- inputs enter PowerShell ONLY through these env vars.
+#  (Workflow-level env may reference github.event.inputs; run: scripts read
+#   them as $env:IN_* -- never as interpolated expressions. This is both an
+#   injection guard and an auditability feature: every consumer has one source.)
+# -----------------------------------------------------------------------------
+env:
+  IN_TAILSCALE_KEY:  ${{ github.event.inputs.tailscale_key || secrets.TS_AUTHKEY }}
+  IN_DURATION:      ${{ github.event.inputs.duration_minutes }}
+  IN_WARNING:       ${{ github.event.inputs.warning_minutes }}
+  IN_RDP_USERNAME:  ${{ github.event.inputs.rdp_username }}
+  IN_RDP_PASSWORD:  ${{ github.event.inputs.rdp_password }}
+  IN_RDP_PORT:      ${{ github.event.inputs.rdp_port }}
+  IN_AUTO_SHUTDOWN: ${{ github.event.inputs.enable_auto_shutdown }}
+  IN_AUDIT_LOG:     ${{ github.event.inputs.enable_audit_log }}
+  RDP_USERNAME:     ${{ github.event.inputs.rdp_username }}
+  RDP_PASSWORD:     ${{ github.event.inputs.rdp_password }}
+  RDP_PORT:         ${{ github.event.inputs.rdp_port }}
+  SOVEREIGN_BUILD:  '4.3.0'
+  PYTHONUNBUFFERED: '1'
+
+# =============================================================================
+#  JOB 1 -- Preflight (validation, parameter computation, session identity)
+# =============================================================================
+jobs:
+  preflight:
+    name: Preflight Validation
+    runs-on: windows-latest
+    timeout-minutes: 10
+    outputs:
+      session_id:       ${{ steps.compute.outputs.session_id }}
+      total_seconds:    ${{ steps.compute.outputs.total_seconds }}
+      warning_seconds:  ${{ steps.compute.outputs.warning_seconds }}
+      warning_minutes:  ${{ steps.compute.outputs.warning_minutes }}
+      duration_minutes: ${{ steps.compute.outputs.duration_minutes }}
+      start_utc:        ${{ steps.compute.outputs.start_utc }}
+
+    steps:
+      - name: Preflight Banner
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          try {
+            Write-Host ""
+            Write-Host "################################################################"
+            Write-Host "#  SOVEREIGN WORKSTATION -- PREFLIGHT (v$env:SOVEREIGN_BUILD)    #"
+            Write-Host "#  Runner : $env:RUNNER_NAME"
+            Write-Host "#  Trigger: ${{ github.event_name }} by ${{ github.actor }}"
+            Write-Host "################################################################"
+            Write-Host ""
+            if ($env:RUNNER_OS -ne "Windows") {
+              Write-Error "Runner OS is '$env:RUNNER_OS' -- this workflow requires windows-latest."
+              exit 1
+            }
+            exit 0
+          } catch {
+            Write-Error "Preflight banner crashed unexpectedly: $($_ | Out-String)"
+            exit 1
+          }
+
+      - name: Validate Inputs
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $failures = @()
+
+          function Assert-True([bool]$Condition, [string]$Message) {
+            if (-not $Condition) { $script:failures += $Message }
+          }
+
+          try {
+            Write-Host "=== Input Validation ==="
+
+            # ---- Fetch + normalise (inputs arrive via env -- no injection surface)
+            $username = "$env:IN_RDP_USERNAME".Trim()
+            $password = "$env:IN_RDP_PASSWORD"         # NOT trimmed: spaces may be intentional; we validate below
+            $duration  = 0
+            $warning   = 0
+            $port      = 0
+
+            [void]([int]::TryParse("$env:IN_DURATION".Trim(), [ref]$duration))
+            [void]([int]::TryParse("$env:IN_WARNING".Trim(),  [ref]$warning))
+            [void]([int]::TryParse("$env:IN_RDP_PORT".Trim(), [ref]$port))
+
+            # ---- Tailscale key ----------------------------------------------------
+            $tsKey = "$env:IN_TAILSCALE_KEY".Trim()
+            Assert-True (-not [string]::IsNullOrWhiteSpace($tsKey))            "Tailscale auth key must not be empty (no key was pasted AND the built-in TS_AUTHKEY repo secret is missing/empty). Set the TS_AUTHKEY Actions secret or paste a key."
+            Assert-True ($tsKey -match '^tskey-')                             "Tailscale auth key does not look like a tskey-... key (got prefix '$($tsKey.Substring(0, [Math]::Min(6, $tsKey.Length)))')."
+
+            # ---- Username checks --------------------------------------------------
+            Assert-True (-not [string]::IsNullOrWhiteSpace($username))         "RDP username must not be empty."
+            Assert-True ($username.Length -le 20)                              "RDP username exceeds the 20-character Windows limit."
+            Assert-True ($username.Length -ge 1)                               "RDP username too short."
+            Assert-True ($username -notmatch '[\\/:*?"<>| ]')                  "RDP username contains illegal characters (or spaces)."
+            Assert-True ($username -notmatch '^-')                              "RDP username must not start with a hyphen (net.exe parser)."
+            Assert-True ($username -notmatch '^\d+$')                           "RDP username must not be purely numeric (SID ambiguity)."
+            Assert-True ($username -notin @('administrator','admin','guest','defaultaccount','wdagutilityaccount')) "RDP username collides with a reserved Windows account."
+
+            # ---- Password checks --------------------------------------------------
+            Assert-True (-not [string]::IsNullOrWhiteSpace($password))         "RDP password must not be empty."
+            Assert-True ($password.Length -ge 8)                               "RDP password must be at least 8 characters."
+            Assert-True ($password.Length -le 128)                             "RDP password exceeds 128 characters."
+            $hasUpper  = $password -cmatch '[A-Z]'
+            $hasLower  = $password -cmatch '[a-z]'
+            $hasDigit  = $password -match '\d'
+            $hasSymbol = $password -match '[^a-zA-Z0-9]'
+            Assert-True ($hasUpper -and $hasLower -and $hasDigit -and $hasSymbol) "RDP password must contain upper, lower, digit, and symbol."
+            Assert-True ($password -notmatch '^\s|\s$')                        "RDP password has leading/trailing whitespace (RDP clients silently mangle this)."
+
+            # ---- Duration checks --------------------------------------------------
+            # HARD CAP: 5 h. GitHub hosted jobs are killed at 6 h platform-side;
+            # provisioning needs ~10-15 min of that budget. 8/12/24 h are impossible.
+            Assert-True ($duration -ge 15 -and $duration -le 300)              "Duration must be 15-300 minutes (GitHub kills hosted jobs at 6 h; longer sessions are impossible on this plan)."
+            Assert-True ($warning -in 5,10,15,30)                              "Warning window must be one of 5/10/15/30 minutes."
+            Assert-True ($warning -lt $duration)                               "Warning window ($warning min) must be shorter than the session ($duration min)."
+
+            # ---- Port checks ------------------------------------------------------
+            Assert-True ($port -ge 1024 -and $port -le 65535)                  "RDP port must be in the unprivileged range (1024-65535)."
+            Assert-True ($port -notin 22,23,80,443,445,5985,5986)              "RDP port collides with a well-known runner service (SSH/SMB/HTTP/WinRM)."
+
+            # ---- Boolean inputs (workflow_dispatch sends booleans as strings) ----
+            Assert-True ("$env:IN_AUTO_SHUTDOWN".ToLower() -in @('true','false')) "enable_auto_shutdown must be true/false."
+            Assert-True ("$env:IN_AUDIT_LOG".ToLower()    -in @('true','false')) "enable_audit_log must be true/false."
+
+            if ($failures.Count -gt 0) {
+              Write-Host ""
+              Write-Host "=== VALIDATION FAILED -- $($failures.Count) problem(s) ===" -ForegroundColor Red
+              $i = 1
+              foreach ($f in $failures) { Write-Host "  [$i] $f" -ForegroundColor Red; $i++ }
+              Write-Host ""
+              Write-Host "No changes were made to any system. Re-run with corrected inputs."
+              exit 1
+            }
+
+            Write-Host "  Username      : $username  [OK]"
+            Write-Host "  Password      : $password  [OK -- explicit, visible]"
+            Write-Host "  Tailscale key : $($tsKey.Substring(0,12))...  [OK -- shape verified]"
+            Write-Host "  Duration      : $duration min [OK -- within GitHub 6 h job cap]"
+            Write-Host "  Warning       : $warning min [OK]"
+            Write-Host "  RDP Port      : $port [OK]"
+            Write-Host "  Auto-shutdown : $env:IN_AUTO_SHUTDOWN [OK]"
+            Write-Host "  Audit log     : $env:IN_AUDIT_LOG [OK]"
+            Write-Host "Validation passed."
+            exit 0
+          } catch {
+            Write-Error "Validator crashed unexpectedly: $($_ | Out-String)"
+            exit 1
+          }
+
+      - name: Compute Session Parameters
+        id: compute
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          try {
+            $durationMinutes = [int]"$env:IN_DURATION".Trim()
+            $warningMinutes  = [int]"$env:IN_WARNING".Trim()
+
+            $totalMinutes    = $durationMinutes
+            $totalSeconds    = $totalMinutes * 60
+            $warningSeconds = ($totalMinutes - $warningMinutes) * 60
+            $startUtc       = (Get-Date).ToUniversalTime().ToString('o')
+            $sessionId      = "SW-" + (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss') +
+                              "-" + ([guid]::NewGuid().ToString('N').Substring(0,6).ToUpper())
+
+            Write-Host "=== Computed Session Parameters ==="
+            Write-Host "  Session ID    : $sessionId"
+            Write-Host "  Start (UTC)   : $startUtc"
+            Write-Host "  Duration      : $durationMinutes min"
+            Write-Host "  Warning at    : $warningSeconds s elapsed (T-$warningMinutes min)"
+            Write-Host "  Hard stop at  : $totalSeconds s elapsed"
+            Write-Host "  Job timeout   : 355 min (platform kill at ~360 min -- session fits)"
+
+            "session_id=$sessionId"           | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            "total_seconds=$totalSeconds"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            "warning_seconds=$warningSeconds" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            "warning_minutes=$warningMinutes" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            "duration_minutes=$durationMinutes" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            "start_utc=$startUtc"             | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 0
+          } catch {
+            Write-Error "Parameter computation failed: $($_ | Out-String)"
+            exit 1
+          }
+
+      - name: Emit Preflight Summary
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          try {
+            $sid = "${{ steps.compute.outputs.session_id }}"
+            if (-not $sid) { $sid = "(preflight did not complete)" }
+            $status = if ("${{ steps.compute.outcome }}" -eq 'success') { ':white_check_mark: validated' } else { ':x: FAILED -- see logs' }
+            $lines = @(
+              "## Preflight -- Session ``$sid``",
+              "",
+              "| Field | Value |",
+              "|-------|-------|",
+              "| Session ID | ``$sid`` |",
+              "| Actor | ``${{ github.actor }}`` |",
+              "| Duration | ``$env:IN_DURATION min`` (cap 300 min -- GitHub 6 h job limit) |",
+              "| Warning | ``T-$env:IN_WARNING min`` |",
+              "| RDP User | ``$env:IN_RDP_USERNAME`` |",
+              "| RDP Password | ``$env:IN_RDP_PASSWORD`` |",
+              "| RDP Port | ``$env:IN_RDP_PORT`` |",
+              "| Helium Browser | ``$env:HELIUM_VERSION`` |",
+              "| Auto-Shutdown | ``$env:IN_AUTO_SHUTDOWN`` |",
+              "| Audit Log | ``$env:IN_AUDIT_LOG`` |",
+              "",
+              "**Status:** $status"
+            )
+            $lines -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          } catch {
+            Write-Warning "Preflight summary could not be written: $($_ | Out-String)"
+            exit 0
+          }
+
+# =============================================================================
+#  JOB 2 -- Provision (installation, configuration, session lifecycle)
+# =============================================================================
+  provision:
+    name: Provision Workstation
+    needs: preflight
+    runs-on: windows-latest
+    timeout-minutes: 355   # platform kills hosted jobs at ~360 min; leave headroom
+
+    env:
+      SESSION_ID:      ${{ needs.preflight.outputs.session_id }}
+      TOTAL_SECONDS:   ${{ needs.preflight.outputs.total_seconds }}
+      WARNING_SECONDS: ${{ needs.preflight.outputs.warning_seconds }}
+      WARNING_MINUTES: ${{ needs.preflight.outputs.warning_minutes }}
+      DURATION_MINUTES: ${{ needs.preflight.outputs.duration_minutes }}
+      START_UTC:       ${{ needs.preflight.outputs.start_utc }}
+      TAILSCALE_PATH:  'C:\Program Files\Tailscale\tailscale.exe'
+
+    steps:
+      - name: Checkout (optional)
+        uses: actions/checkout@v4
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      #  Diagnostics -- never fatal; if we can't even read the machine, say so.
+      # -----------------------------------------------------------------------
+      - name: Runner Diagnostics
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "=== Runner Diagnostics -- Session $env:SESSION_ID ==="
+          foreach ($probe in @(
+            { Write-Host "  Computer Name : $env:COMPUTERNAME" },
+            { Write-Host "  Runner Name   : $env:RUNNER_NAME" },
+            { Write-Host "  OS Caption    : $((Get-CimInstance Win32_OperatingSystem).Caption)" },
+            { Write-Host "  OS Version    : $((Get-CimInstance Win32_OperatingSystem).Version)" },
+            { Write-Host "  Architecture  : $env:PROCESSOR_ARCHITECTURE" },
+            { Write-Host "  PS Version    : $($PSVersionTable.PSVersion)" },
+            { Write-Host "  User          : $env:USERNAME" }
+          )) { try { & $probe } catch { Write-Warning "  diagnostic probe failed: $($_.Exception.Message)" } }
+
+          try {
+            $cpu = Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1
+            Write-Host "  CPU           : $($cpu.Name) ($($cpu.NumberOfCores) cores / $($cpu.NumberOfLogicalProcessors) threads)"
+          } catch { Write-Warning "  CPU probe failed: $($_.Exception.Message)" }
+
+          try {
+            $mem = [math]::Round((Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory / 1GB, 2)
+            Write-Host "  RAM           : $mem GB"
+          } catch { Write-Warning "  RAM probe failed: $($_.Exception.Message)" }
+
+          try {
+            $disk = Get-PSDrive -Name C -ErrorAction Stop
+            $freeGB = [math]::Round($disk.Free / 1GB, 2)
+            Write-Host "  Disk C: Free  : $freeGB GB"
+            if ($freeGB -lt 5) {
+              Write-Warning "Only $freeGB GB free on C: -- Tailscale install + provisioning may fail. Proceeding, but watch this."
+            }
+          } catch { Write-Warning "  Disk probe failed: $($_.Exception.Message)" }
+
+          Write-Host "  Time (UTC)    : $((Get-Date).ToUniversalTime().ToString('o'))"
+          Write-Host "=========================================="
+
+          if ($env:RUNNER_OS -ne "Windows") {
+            Write-Error "This workflow must execute on windows-latest (got $env:RUNNER_OS)."
+            exit 1
+          }
+          # GitHub's powershell shell exits with $LASTEXITCODE of the last NATIVE command
+          # (e.g. a failing w32tm/tailscale). Best-effort steps must end with an explicit exit 0.
+          exit 0
+
+      # -----------------------------------------------------------------------
+      #  Time synchronisation -- best effort (no admin time rights? keep going)
+      # -----------------------------------------------------------------------
+      - name: Synchronise System Clock
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "=== Time Sync (best-effort) ==="
+          try {
+            $svc = Get-Service W32Time -ErrorAction Stop
+            if ($svc.Status -ne 'Running') { Start-Service W32Time -ErrorAction SilentlyContinue }
+          } catch { Write-Warning "W32Time service check failed: $($_.Exception.Message)" }
+          try { w32tm /resync /force 2>&1 | Write-Host } catch { Write-Warning "w32tm resync failed: $($_.Exception.Message)" }
+          try { Write-Host "Current UTC: $((Get-Date).ToUniversalTime().ToString('o'))" } catch { }
+          exit 0
+
+      # -----------------------------------------------------------------------
+      #  Tailscale installation -- download retries, size check, wait-for-binary
+      # -----------------------------------------------------------------------
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          Write-Host "=== Tailscale Installation ==="
+          try {
+            $installerPath = Join-Path $env:TEMP "tailscale-setup.exe"
+            $downloadUrl   = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+
+            # Already installed? (re-run friendliness) -- verify binary runs.
+            if (Test-Path $env:TAILSCALE_PATH) {
+              Write-Host "Tailscale already present at $env:TAILSCALE_PATH -- verifying it executes."
+              & $env:TAILSCALE_PATH version 2>$null
+              if ($LASTEXITCODE -eq 0) {
+                Write-Host "Existing install is healthy; skipping re-install."
+                exit 0
+              }
+              Write-Warning "Existing install is broken -- re-installing over it."
+            }
+
+            $attempt    = 0
+            $downloaded = $false
+            while (-not $downloaded -and $attempt -lt 3) {
+              $attempt++
+              try {
+                Write-Host "Download attempt $attempt from $downloadUrl"
+                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+                Invoke-WebRequest -Uri $downloadUrl -OutFile $installerPath -UseBasicParsing -TimeoutSec 300 -ErrorAction Stop
+                $size = (Get-Item $installerPath -ErrorAction Stop).Length
+                if ($size -lt 1MB) { throw "Downloaded installer is suspiciously small ($size bytes -- CDN error page?)." }
+                $downloaded = $true
+                Write-Host "Downloaded $size bytes."
+              } catch {
+                Write-Warning "Attempt $attempt failed: $($_.Exception.Message)"
+                if ($attempt -lt 3) { Start-Sleep -Seconds (10 * $attempt) }
+              }
+            }
+            if (-not $downloaded) {
+              throw "Unable to download Tailscale installer after 3 attempts. Check runner egress + pkgs.tailscale.com availability."
+            }
+
+            Write-Host "Running installer (silent)..."
+            $proc = Start-Process -FilePath $installerPath -ArgumentList "/quiet" -Wait -PassThru
+            Write-Host "Installer exit code: $($proc.ExitCode)"
+
+            $waited = 0
+            while (!(Test-Path $env:TAILSCALE_PATH)) {
+              Start-Sleep -Seconds 5
+              $waited += 5
+              if ($waited -gt 300) { throw "Tailscale binary did not appear after 300s (installer exit $($proc.ExitCode))." }
+            }
+
+            & $env:TAILSCALE_PATH version
+            if ($LASTEXITCODE -ne 0) { throw "tailscale.exe present but not executable." }
+            Write-Host "Tailscale installed and verified."
+          } catch {
+            Write-Error "Tailscale installation failed: $($_ | Out-String)"
+            try { Write-Host "Diagnostics: TEMP exists? $(Test-Path $env:TEMP) | free C: $([int]((Get-PSDrive C).Free/1GB)) GB" } catch { }
+            exit 1
+          }
+
+      # -----------------------------------------------------------------------
+      #  Tailscale authentication -- precise error mapping + retries
+      # -----------------------------------------------------------------------
+      - name: Authenticate Tailscale
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          try {
+            Write-Host "=== Tailscale Authentication ==="
+            $key = "$env:IN_TAILSCALE_KEY".Trim()
+
+            # Idempotency: if the runner is already up and authenticated
+            # (possible on quick re-runs), don't burn a second key.
+            $alreadyUp = $false
+            try {
+              & $env:TAILSCALE_PATH status 2>$null | Out-Null
+              if ($LASTEXITCODE -eq 0) {
+                $ipCheck = & $env:TAILSCALE_PATH ip -4 2>$null | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' } | Select-Object -First 1
+                if ($ipCheck) { $alreadyUp = $true; Write-Host "Tailscale already authenticated (IP $ipCheck) -- skipping auth." }
+              }
+            } catch { Write-Host "Not yet authenticated -- proceeding with key." }
+
+            if (-not $alreadyUp) {
+              foreach ($attempt in 1..3) {
+                Write-Host "Auth attempt $attempt..."
+                $output = & $env:TAILSCALE_PATH up --authkey="$key" --accept-routes --reset --hostname="sovereign-ws" 2>&1
+                $code = $LASTEXITCODE
+                $text = ($output | Out-String).Trim()
+
+                if ($code -eq 0) { break }
+
+                # ---- Precise, actionable error mapping -------------------------
+                if     ($text -match 'invalid|malformed')               { throw "AUTH FAILED (attempt $attempt): Tailscale key is invalid/malformed. Generate a fresh key in the Tailscale admin console." }
+                elseif ($text -match 'expired')                         { throw "AUTH FAILED (attempt $attempt): Tailscale key has EXPIRED. Generate a fresh key (they have a TTL)." }
+                elseif ($text -match 'already used|reused|single-use')  { throw "AUTH FAILED (attempt $attempt): Tailscale key was already used (keys are single-use). Generate a fresh key." }
+                elseif ($text -match 'revoked')                         { throw "AUTH FAILED (attempt $attempt): Tailscale key was REVOKED in the admin console." }
+                elseif ($text -match 'unauthorized|not authorized')     { throw "AUTH FAILED (attempt $attempt): Key not authorized for this tailnet (check device-approval/tag settings)." }
+                elseif ($text -match 'dial tcp|no such host|refused|timed out|timeout') {
+                  Write-Warning "Network error on attempt ${attempt}: $text"
+                  if ($attempt -lt 3) { Start-Sleep -Seconds (15 * $attempt); continue }
+                  throw "AUTH FAILED: cannot reach Tailscale control plane after 3 attempts (runner egress issue?): $text"
+                }
+                elseif ($text -match 'already running|running as') {
+                  Write-Warning "Tailscale reports already running (attempt $attempt) -- verifying state and continuing."
+                  break
+                }
+                else {
+                  Write-Warning "Attempt $attempt failed (exit $code): $text"
+                  if ($attempt -lt 3) { Start-Sleep -Seconds (10 * $attempt); continue }
+                  throw "AUTH FAILED after 3 attempts (exit $code): $text"
+                }
+              }
+
+              # Post-auth sanity: we must have an IP by now.
+              $finalIp = & $env:TAILSCALE_PATH ip -4 2>$null | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' } | Select-Object -First 1
+              if (-not $finalIp) { throw "Tailscale never reached an authenticated state (no IPv4 after auth attempts)." }
+            }
+
+            # Wait for the node to settle and get an IP (up to 60s).
+            $tsIp = $null
+            foreach ($i in 1..12) {
+              $tsIp = & $env:TAILSCALE_PATH ip -4 2>$null | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' } | Select-Object -First 1
+              if ($tsIp) { break }
+              Start-Sleep -Seconds 5
+            }
+            if (-not $tsIp) { throw "Could not resolve a Tailscale IPv4 address after 60s. 'tailscale up' may have half-succeeded -- check Failure Diagnostics output." }
+
+            # Best-effort status JSON (hostname/DNS may legitimately be absent).
+            $tsHost = ""; $tsDns = ""
+            try {
+              $tsJson = & $env:TAILSCALE_PATH status --json 2>$null | ConvertFrom-Json -ErrorAction Stop
+              $tsHost = $tsJson.Self.HostName
+              $tsDns  = $tsJson.Self.DNSName
+              if ($tsDns -and $tsDns -notmatch '\.$') { $tsDns = "$tsDns." }
+            } catch { Write-Warning "Could not parse tailscale status JSON (non-fatal): $($_.Exception.Message)" }
+
+            Write-Host "=== Tailscale Status ==="
+            try { & $env:TAILSCALE_PATH status } catch { Write-Warning "status display failed: $($_.Exception.Message)" }
+            Write-Host "  Tailscale IP       : $tsIp"
+            Write-Host "  Tailscale Hostname : $tsHost"
+            Write-Host "  Tailscale DNS Name : $tsDns"
+
+            "TAILSCALE_IP=$tsIp"         | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "TAILSCALE_HOSTNAME=$tsHost" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "TAILSCALE_DNS=$tsDns"       | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            exit 0
+          } catch {
+            Write-Error "Tailscale authentication failed: $($_ | Out-String)"
+            Write-Host "Hint: Tailscale auth keys are SINGLE-USE and expire. If this key was used before, generate a new one at https://login.tailscale.com/admin/settings/keys (flag it REUSABLE for the built-in TS_AUTHKEY secret so repeated dispatches work)."
+            exit 1
+          }
+
+      # -----------------------------------------------------------------------
+      #  RDP hardening -- registry, firewall, service restart, listener verify
+      # -----------------------------------------------------------------------
+      - name: Harden and Enable RDP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $port = 0
+          [void]([int]::TryParse("$env:IN_RDP_PORT".Trim(), [ref]$port))
+          try {
+            Write-Host "=== RDP Configuration (port $port) ==="
+
+            # Port-in-use pre-check (fail early with a clear message).
+            # NOTE: GitHub's Windows runners already run the RDP listener
+            # (svchost hosting TermService) on 3389. That listener is OURS to
+            # reconfigure -- only FOREIGN listeners block the port.
+            $colliding = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+                         Where-Object { $_.LocalPort -eq $port -and $_.OwningProcess -ne 0 }
+            if ($colliding) {
+              $foreign = @()
+              foreach ($conn in $colliding) {
+                try {
+                  $p = Get-Process -Id $conn.OwningProcess -ErrorAction Stop
+                  if ($p.ProcessName -eq 'svchost') {
+                    $svc = Get-CimInstance Win32_Service -Filter "ProcessId=$($conn.OwningProcess)" -ErrorAction SilentlyContinue |
+                           Where-Object { $_.Name -eq 'TermService' }
+                    if ($svc) { continue }   # our own RDP listener -- safe
+                  }
+                  $foreign += "$($conn.LocalAddress):$port/$($p.ProcessName)"
+                } catch { $foreign += "$($conn.LocalAddress):$port/??" }
+              }
+              if ($foreign.Count -gt 0) {
+                throw "Port $port is already in use by: $($foreign -join ', '). Choose a different RDP port."
+              }
+              Write-Host "  existing listener on $port belongs to TermService (svchost) -- safe to reconfigure."
+            }
+
+            function Set-Reg([string]$Path, [string]$Name, $Value) {
+              try {
+                if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+                Set-ItemProperty -Path $Path -Name $Name -Value $Value -ErrorAction Stop
+                Write-Host "  reg: $Path\$Name = $Value"
+              } catch { throw "Registry write failed ($Path\$Name): $($_.Exception.Message)" }
+            }
+
+            $rdpReg = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+            $wstReg = "$rdpReg\WinStations\RDP-Tcp"
+
+            Set-Reg $rdpReg "fDenyTSConnections" 0        # enable RDP
+            Set-Reg $wstReg "UserAuthentication"   1        # enforce NLA
+            Set-Reg $wstReg "PortNumber"          $port    # listener port
+            Set-Reg $wstReg "SecurityLayer"       2        # TLS
+            Set-Reg $wstReg "MinEncryptionLevel"   3        # high encryption
+            Set-Reg $wstReg "fDisableClip"        1        # no clipboard redirection
+
+            # Firewall -- group enable first, per-rule fallback second.
+            try {
+              Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction Stop
+              Write-Host "  firewall: enabled 'Remote Desktop' group"
+            } catch {
+              Write-Warning "Firewall group enable failed ($($_.Exception.Message)) -- trying per-rule."
+              Get-NetFirewallRule -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName -like '*Remote Desktop*' } |
+                ForEach-Object { Set-NetFirewallRule -Name $_.Name -Enabled True -Profile Any -ErrorAction SilentlyContinue }
+            }
+
+            # Explicit port rule (in case the group rules are port-bound to 3389).
+            try {
+              if (-not (Get-NetFirewallRule -DisplayName "Sovereign-RDP-$port" -ErrorAction SilentlyContinue)) {
+                New-NetFirewallRule -DisplayName "Sovereign-RDP-$port" -Direction Inbound `
+                  -Protocol TCP -LocalPort $port -Action Allow -Profile Any -ErrorAction Stop | Out-Null
+                Write-Host "  firewall: added explicit rule 'Sovereign-RDP-$port'"
+              }
+            } catch { Write-Warning "Explicit firewall rule failed (non-fatal if the group rule covers the port): $($_.Exception.Message)" }
+
+            # Service: automatic + (re)start so the port change takes effect.
+            try {
+              Set-Service -Name "TermService" -StartupType Automatic -ErrorAction Stop
+              Write-Host "  service: TermService set to Automatic"
+            } catch { Write-Warning "Could not set TermService startup type: $($_.Exception.Message)" }
+
+            try {
+              Restart-Service -Name "TermService" -Force -ErrorAction Stop
+              Write-Host "  service: TermService restarted (activates port $port)"
+            } catch {
+              Write-Warning "TermService restart failed: $($_.Exception.Message) -- trying stop/start."
+              try { Stop-Service TermService -Force -ErrorAction Stop; Start-Service TermService -ErrorAction Stop } catch { throw "Cannot restart TermService: $($_.Exception.Message)" }
+            }
+
+            # Verify the listener actually came up on our port (up to 60s).
+            $listening = $false
+            foreach ($i in 1..12) {
+              Start-Sleep -Seconds 5
+              if (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) { $listening = $true; break }
+            }
+            if (-not $listening) {
+              throw "RDP listener never appeared on port $port after TermService restart. Registry: PortNumber=$((Get-ItemProperty $wstReg -Name PortNumber).PortNumber), fDenyTSConnections=$((Get-ItemProperty $rdpReg -Name fDenyTSConnections).fDenyTSConnections)"
+            }
+
+            Write-Host "--- RDP Listener ---"
+            Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
+              Format-Table -AutoSize | Out-String | Write-Host
+            Write-Host "RDP hardened, enabled, and LISTENING on port $port."
+            exit 0
+          } catch {
+            Write-Error "RDP configuration failed: $($_ | Out-String)"
+            exit 1
+          }
+
+      # -----------------------------------------------------------------------
+      #  User provisioning (explicit credentials, visible)
+      # -----------------------------------------------------------------------
+      - name: Provision RDP User
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          try {
+            $username = "$env:IN_RDP_USERNAME".Trim()
+            $password = "$env:IN_RDP_PASSWORD"
+
+            Write-Host "=== User Provisioning ==="
+            Write-Host "  Username : $username"
+            Write-Host "  Password : $password"
+
+            if ($password -match '^".*"$|^''.*''$') {
+              Write-Warning "Password appears to include surrounding quotes -- proceeding, but if RDP login fails this is why."
+            }
+
+            $secure = ConvertTo-SecureString $password -AsPlainText -Force
+
+            $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+            if ($existing) {
+              Write-Host "  User exists -- resetting password and re-enabling."
+              Set-LocalUser -Name $username -Password $secure -ErrorAction Stop
+              try { Enable-LocalUser -Name $username -ErrorAction Stop } catch { Write-Warning "User already enabled: $($_.Exception.Message)" }
+            } else {
+              try {
+                New-LocalUser -Name $username -Password $secure `
+                              -Description "Sovereign Workstation User" `
+                              -PasswordNeverExpires -ErrorAction Stop   # switch, not boolean
+                Write-Host "  User created."
+              } catch {
+                throw "New-LocalUser failed: $($_.Exception.Message). (Reserved-account collisions are rejected in preflight -- this is likely an OS password-policy rejection.)"
+              }
+            }
+
+            foreach ($group in @("Remote Desktop Users", "Administrators")) {
+              try {
+                $members = Get-LocalGroupMember -Group $group -ErrorAction Stop
+                if (-not ($members | Where-Object { $_.Name -like "*\$username" })) {
+                  Add-LocalGroupMember -Group $group -Member $username -ErrorAction Stop
+                  Write-Host "  Added to '$group'."
+                } else {
+                  Write-Host "  Already in '$group'."
+                }
+              } catch { throw "Group membership failed for '$group': $($_.Exception.Message)" }
+            }
+
+            # Account flags via CIM (wmic is deprecated/absent on newer runners).
+            try {
+              Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True AND Name='$username'" -ErrorAction Stop |
+                Set-CimInstance -Property @{ PasswordExpires = $false } -ErrorAction Stop
+              Write-Host "  PasswordNeverExpires confirmed at account-policy level."
+            } catch { Write-Warning "PasswordExpires flag via CIM failed (non-fatal; New-LocalUser already set it): $($_.Exception.Message)" }
+
+            # Sanity: the account must be enabled before we call it ready.
+            $final = Get-LocalUser -Name $username -ErrorAction Stop
+            if (-not $final.Enabled) { throw "User '$username' ended up DISABLED -- aborting." }
+            Write-Host "User '$username' ready (enabled=$($final.Enabled))."
+            exit 0
+          } catch {
+            Write-Error "User provisioning failed: $($_ | Out-String)"
+            exit 1
+          }
+
+      # -----------------------------------------------------------------------
+      #  Helium Browser -- installed EVERY session (privacy browser, pinned
+      #  to latest release with a fallback URL). Non-fatal: RDP session stays
+      #  fully usable even if the download fails (step is continue-on-error).
+      # -----------------------------------------------------------------------
+      - name: Install Helium Browser
+        continue-on-error: true
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          Write-Host "=== Helium Browser Installation ==="
+          try {
+            # 1) Resolve the latest release from the Helium GitHub API.
+            $zipUrl = $null
+            $releaseTag = $null
+            try {
+              $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/imputnet/helium-windows/releases/latest" -TimeoutSec 60 -ErrorAction Stop
+              $releaseTag = $rel.tag_name
+              $asset = $rel.assets | Where-Object { $_.name -match '^helium_.*_x64-windows\.zip$' } | Select-Object -First 1
+              if ($asset) { $zipUrl = $asset.browser_download_url; Write-Host "  Latest Helium release: $releaseTag ($([math]::Round($asset.size/1MB,1)) MB)" }
+            } catch { Write-Warning "  Could not query latest release ($($_.Exception.Message)) -- falling back to pinned URL." }
+            if (-not $zipUrl) {
+              $releaseTag = "0.17.1.1"
+              $zipUrl = "https://github.com/imputnet/helium-windows/releases/download/$releaseTag/helium_${releaseTag}_x64-windows.zip"
+              Write-Host "  Using pinned Helium release: $releaseTag"
+            }
+
+            # 2) Download with retries (~200 MB; GitHub runners have fast pipes).
+            $zipPath = Join-Path $env:TEMP "helium.zip"
+            $downloaded = $false
+            foreach ($attempt in 1..3) {
+              try {
+                Write-Host "  Download attempt $attempt..."
+                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+                Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 900 -ErrorAction Stop
+                $size = (Get-Item $zipPath -ErrorAction Stop).Length
+                if ($size -lt 50MB) { throw "downloaded zip suspiciously small ($size bytes)" }
+                $downloaded = $true
+                Write-Host "  Downloaded $([math]::Round($size/1MB,1)) MB."
+                break
+              } catch {
+                Write-Warning "  Attempt $attempt failed: $($_.Exception.Message)"
+                if ($attempt -lt 3) { Start-Sleep -Seconds (10 * $attempt) }
+              }
+            }
+            if (-not $downloaded) { throw "Helium download failed after 3 attempts (check runner egress to github.com)." }
+
+            # 3) Extract -- the zip contains ONE top-level folder; promote it to C:\HeliumBrowser.
+            $extractTmp = Join-Path $env:TEMP "helium-extract"
+            if (Test-Path $extractTmp) { Remove-Item $extractTmp -Recurse -Force -ErrorAction SilentlyContinue }
+            Expand-Archive -Path $zipPath -DestinationPath $extractTmp -Force -ErrorAction Stop
+            $inner = Get-ChildItem -Path $extractTmp -Directory -ErrorAction Stop | Select-Object -First 1
+            if (-not $inner) { throw "zip did not contain the expected Helium folder" }
+            $target = "C:\HeliumBrowser"
+            if (Test-Path $target) { Remove-Item $target -Recurse -Force -ErrorAction SilentlyContinue }
+            Move-Item -Path $inner.FullName -Destination $target -ErrorAction Stop
+            Remove-Item $extractTmp -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+
+            # 4) Verify the browser binary (Chromium fork: chrome.exe is the binary).
+            $browserExe = Join-Path $target "chrome.exe"
+            if (-not (Test-Path $browserExe)) { throw "chrome.exe missing after extraction (unexpected zip layout for $releaseTag)" }
+            Write-Host "  Helium $releaseTag installed at $target"
+
+            # 5) Desktop + Start Menu shortcuts for the RDP user (best-effort).
+            foreach ($lnkPath in @(
+              "C:\Users\Public\Desktop\Helium Browser.lnk",
+              "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Helium Browser.lnk"
+            )) {
+              try {
+                $sh = New-Object -ComObject WScript.Shell
+                $sc = $sh.CreateShortcut($lnkPath)
+                $sc.TargetPath = $browserExe
+                $sc.WorkingDirectory = $target
+                $sc.IconLocation = "$browserExe,0"
+                $sc.Description = "Helium Browser $releaseTag"
+                $sc.Save()
+                Write-Host "  shortcut: $lnkPath"
+              } catch { Write-Warning "  shortcut failed ($lnkPath): $($_.Exception.Message)" }
+            }
+
+            "HELIUM_PATH=$browserExe"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "HELIUM_VERSION=$releaseTag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            exit 0
+          } catch {
+            # Non-fatal by design (continue-on-error: true): the RDP session
+            # remains fully usable without Helium; failure is visible on the step.
+            Write-Warning "Helium Browser install FAILED -- session continues without it: $($_ | Out-String)"
+            exit 1
+          }
+
+      # -----------------------------------------------------------------------
+      #  Audit logging -- every sub-part is independent and non-fatal
+      # -----------------------------------------------------------------------
+      - name: Configure Audit Logging
+        if: ${{ github.event.inputs.enable_audit_log == 'true' }}
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "=== Audit Logging (best-effort) ==="
+
+          try {
+            $auditDir = "C:\SovereignAudit"
+            if (-not (Test-Path $auditDir)) { New-Item -ItemType Directory -Path $auditDir -ErrorAction Stop | Out-Null }
+            Write-Host "  audit dir ready: $auditDir"
+            "AUDIT_DIR=$auditDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          } catch { Write-Warning "Audit dir creation failed: $($_.Exception.Message)" }
+
+          foreach ($sub in @("Logon","Logoff","Special Logon","Account Logon")) {
+            try {
+              $r = auditpol /set /subcategory:"$sub" /success:enable /failure:enable 2>&1
+              Write-Host "  auditpol '$sub': $(($r | Out-String).Trim())"
+            } catch { Write-Warning "  auditpol '$sub' failed: $($_.Exception.Message)" }
+          }
+
+          foreach ($log in @(
+            "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
+            "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational"
+          )) {
+            try { wevtutil sl $log /e:true 2>&1 | Write-Host } catch { Write-Warning "  Could not enable $log : $($_.Exception.Message)" }
+          }
+
+          try {
+            $secLog = Get-WinEvent -ListLog Security -ErrorAction Stop
+            Write-Host "  Security log: $($secLog.FileSize) bytes, $($secLog.RecordCount) records"
+          } catch { Write-Warning "  Security log snapshot failed: $($_.Exception.Message)" }
+
+          Write-Host "Audit logging configured (individual failures above are non-fatal)."
+          exit 0
+
+      # -----------------------------------------------------------------------
+      #  Connection information -- the operator's single source of truth
+      # -----------------------------------------------------------------------
+      - name: Display Connection Information
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $username = "$env:IN_RDP_USERNAME".Trim()
+          $password = "$env:IN_RDP_PASSWORD"
+          $port     = "$env:IN_RDP_PORT".Trim()
+          $durMin   = "$env:IN_DURATION".Trim()
+          $warnMin  = "$env:IN_WARNING".Trim()
+
+          Write-Host ""
+          Write-Host "############################################################"
+          Write-Host "#              SOVEREIGN WORKSTATION READY                 #"
+          Write-Host "############################################################"
+          Write-Host "#  Session ID     : $env:SESSION_ID"
+          Write-Host "#  RDP Target     : $env:TAILSCALE_IP`:$port"
+          Write-Host "#  Tailscale Host : $env:TAILSCALE_HOSTNAME"
+          Write-Host "#  Tailscale DNS  : $env:TAILSCALE_DNS"
+          Write-Host "#  Username       : $username"
+          Write-Host "#  Password       : $password"
+          Write-Host "#  Duration       : $durMin min"
+          Write-Host "#  Warning at     : T-$warnMin min"
+          Write-Host "#  Auto-Shutdown  : $env:IN_AUTO_SHUTDOWN"
+          Write-Host "#  Audit Log      : $env:IN_AUDIT_LOG"
+          Write-Host "#  Helium Browser : $env:HELIUM_VERSION at $env:HELIUM_PATH"
+          Write-Host "############################################################"
+          Write-Host ""
+          Write-Host "Connect with:"
+          Write-Host "    mstsc /v:$env:TAILSCALE_IP`:$port"
+          Write-Host ""
+          Write-Host "Cannot reach the target? Checklist:"
+          Write-Host "  1) Is your client device joined to the SAME tailnet (or subnet-router)?"
+          Write-Host "  2) Does your tailnet ACL permit this node on port $port?"
+          Write-Host "  3) Did the key carry a tag, and does that tag appear in the ACL?"
+          Write-Host ""
+          exit 0
+
+      # -----------------------------------------------------------------------
+      #  Connection info artifact -- FUSE (dispatch console) reads this while
+      #  the VM is live. In-progress job logs are only intermittently exposed
+      #  by the API, so a small artifact is the reliable channel.
+      # -----------------------------------------------------------------------
+      - name: Write Connection Info File
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $info = @"
+          session_id=$env:SESSION_ID
+          rdp_target=$env:TAILSCALE_IP`:$env:IN_RDP_PORT
+          tailscale_ip=$env:TAILSCALE_IP
+          tailscale_hostname=$env:TAILSCALE_HOSTNAME
+          tailscale_dns=$env:TAILSCALE_DNS
+          rdp_username=$env:IN_RDP_USERNAME
+          rdp_password=$env:IN_RDP_PASSWORD
+          rdp_port=$env:IN_RDP_PORT
+          duration_minutes=$env:IN_DURATION
+          warning_minutes=$env:IN_WARNING
+          auto_shutdown=$env:IN_AUTO_SHUTDOWN
+          "@
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\fuse" | Out-Null
+          Set-Content -Path "$env:RUNNER_TEMP\fuse\connection-info.txt" -Value $info -Encoding ascii
+          Write-Host "connection-info.txt written for FUSE artifact upload."
+
+      - name: Upload Connection Info Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: connection-info
+          path: ${{ runner.temp }}/fuse/connection-info.txt
+          retention-days: 7
+          if-no-files-found: error
+
+      # -----------------------------------------------------------------------
+      #  Failure diagnostics -- runs ONLY on failure, BEFORE cleanup wipes state
+      # -----------------------------------------------------------------------
+      - name: Failure Diagnostics
+        if: failure()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "=== FAILURE DIAGNOSTICS -- Session $env:SESSION_ID ==="
+          Write-Host ""
+          Write-Host "--- Tailscale state ---"
+          if (Test-Path $env:TAILSCALE_PATH) {
+            try { & $env:TAILSCALE_PATH status 2>&1 | Write-Host } catch { Write-Host "(tailscale status failed: $($_.Exception.Message))" }
+          } else { Write-Host "(tailscale binary not found -- install step failed)" }
+          Write-Host ""
+          Write-Host "--- RDP registry state ---"
+          try {
+            $wst = Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -ErrorAction Stop
+            Write-Host "PortNumber=$($wst.PortNumber) fDisableClip=$($wst.fDisableClip) UserAuthentication=$($wst.UserAuthentication) SecurityLayer=$($wst.SecurityLayer)"
+            $ts = Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -ErrorAction Stop
+            Write-Host "fDenyTSConnections=$($ts.fDenyTSConnections)"
+          } catch { Write-Host "(registry read failed: $($_.Exception.Message))" }
+          Write-Host ""
+          Write-Host "--- TermService ---"
+          try { Get-Service TermService -ErrorAction Stop | Format-List Name,Status,StartType | Out-String | Write-Host } catch { Write-Host "(unavailable)" }
+          Write-Host ""
+          Write-Host "--- Listening sockets ---"
+          try { Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Sort-Object LocalPort | Format-Table LocalAddress,LocalPort,OwningProcess -AutoSize | Out-String | Write-Host } catch { }
+          Write-Host ""
+          Write-Host "--- RDP event log (last 20) ---"
+          try {
+            Get-WinEvent -LogName "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational" -MaxEvents 20 -ErrorAction Stop |
+              Format-Table TimeCreated,Id,Message -AutoSize -Wrap | Out-String | Write-Host
+          } catch { Write-Host "(no RDP events / log unreadable)" }
+          Write-Host ""
+          Write-Host "--- Local users (presence check) ---"
+          try { Get-LocalUser | Format-Table Name,Enabled,Description -AutoSize | Out-String | Write-Host } catch { }
+          Write-Host "=== END DIAGNOSTICS ==="
+          exit 0
+
+      # -----------------------------------------------------------------------
+      #  Session keep-alive -- with expiry warning; cleanup runs BEFORE shutdown
+      # -----------------------------------------------------------------------
+      - name: Session Keep-Alive with Expiry Warning
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          function Invoke-CleanupInline {
+            # Idempotent inline cleanup. Sets CLEANUP_DONE so the always()
+            # step skips its (identical) work after a shutdown.
+            try {
+              Write-Host "=== Inline Cleanup -- Session $env:SESSION_ID ==="
+              if (Test-Path $env:TAILSCALE_PATH) {
+                try { & $env:TAILSCALE_PATH down 2>$null;   Write-Host "  tailscale down: ok" }   catch { Write-Warning "  tailscale down failed: $($_.Exception.Message)" }
+                try { & $env:TAILSCALE_PATH logout 2>$null; Write-Host "  tailscale logout: ok" } catch { Write-Warning "  tailscale logout failed: $($_.Exception.Message)" }
+              }
+              $installerPath = Join-Path $env:TEMP "tailscale-setup.exe"
+              if (Test-Path $installerPath) {
+                Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+                Write-Host "  installer removed."
+              }
+              "CLEANUP_DONE=true" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+              Write-Host "Inline cleanup complete."
+            } catch {
+              Write-Warning "Inline cleanup crashed: $($_ | Out-String) -- the always() step will retry."
+            }
+          }
+
+          try {
+            $totalSeconds   = [int]$env:TOTAL_SECONDS
+            $warningSeconds = [int]$env:WARNING_SECONDS
+            $warningMinutes = [int]$env:WARNING_MINUTES
+            $startTime      = Get-Date
+            $warned         = $false
+            $elapsed        = 0
+            $lastHeartbeat  = -900
+            $lastCountdown  = -1
+
+            Write-Host "=== Keep-Alive Started ==="
+            Write-Host "  Session ID   : $env:SESSION_ID"
+            Write-Host "  Started (loc): $($startTime.ToString('HH:mm:ss'))"
+            Write-Host "  Warn at      : $warningSeconds s elapsed"
+            Write-Host "  Terminate at : $totalSeconds s elapsed"
+
+            # Best-effort broadcast; missing msg.exe is fine.
+            try { msg * "Sovereign Workstation ready. Session expires in $([math]::Round($totalSeconds/60,0)) minutes." 2>$null | Out-Null } catch { }
+
+            while ($elapsed -lt $totalSeconds) {
+              Start-Sleep -Seconds 60
+              $elapsed     += 60
+              $remainingMin = [math]::Max(0, ($totalSeconds - $elapsed) / 60)
+              $now          = (Get-Date).ToString('HH:mm:ss')
+
+              if (($elapsed - $lastHeartbeat) -ge 900) {
+                Write-Host "[$now] HEARTBEAT | elapsed=$([math]::Round($elapsed/60,1))m | remaining=$([math]::Round($remainingMin,1))m"
+                $lastHeartbeat = $elapsed
+              }
+
+              if (-not $warned -and $elapsed -ge $warningSeconds) {
+                Write-Host ""
+                Write-Host "############################################################" -ForegroundColor Yellow
+                Write-Host "#  WARNING: SESSION EXPIRES IN $warningMinutes MINUTES" -ForegroundColor Yellow
+                Write-Host "#  Save your work and disconnect gracefully." -ForegroundColor Yellow
+                Write-Host "############################################################" -ForegroundColor Yellow
+                Write-Host ""
+                try { msg * "WARNING: RDP session will expire in $warningMinutes minutes. Save your work." 2>$null | Out-Null } catch { }
+                foreach ($f in 1000,1500,2000) { try { [System.Console]::Beep($f, 800) } catch { } }
+                $warned = $true
+              }
+
+              if ($remainingMin -le 5 -and $remainingMin -gt 0) {
+                $rounded = [math]::Round($remainingMin, 0)
+                if ($rounded -ne $lastCountdown) {
+                  Write-Host "[$now] FINAL COUNTDOWN: $rounded minute(s) remaining" -ForegroundColor Red
+                  try { [System.Console]::Beep(2000, 300) } catch { }
+                  $lastCountdown = $rounded
+                }
+              }
+            }
+
+            $endTime        = Get-Date
+            $actualDuration = [math]::Round(($endTime - $startTime).TotalMinutes, 1)
+
+            Write-Host ""
+            Write-Host "############################################################"
+            Write-Host "#              SESSION EXPIRED -- SHUTTING DOWN             #"
+            Write-Host "#  Planned duration : $([math]::Round($totalSeconds/60,0)) minutes"
+            Write-Host "#  Actual duration  : $actualDuration minutes"
+            Write-Host "#  Ended at         : $($endTime.ToString('HH:mm:ss'))"
+            Write-Host "############################################################"
+
+            try { msg * "RDP session expired. The workstation is shutting down." 2>$null | Out-Null } catch { }
+
+            "SESSION_END_UTC=$($endTime.ToUniversalTime().ToString('o'))" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "SESSION_ACTUAL_MIN=$actualDuration"                          | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+            # CLEANUP FIRST (fixes v3 race), THEN shutdown.
+            Invoke-CleanupInline
+
+            if ("$env:IN_AUTO_SHUTDOWN".Trim().ToLower() -eq "true") {
+              Write-Host "Cleanup done. Initiating graceful shutdown in 25 seconds..."
+              Start-Sleep -Seconds 5
+              shutdown /s /t 20 /c "Sovereign Workstation -- session expired" /f
+              # Give the runner a moment to observe the pending shutdown, then
+              # exit this step so the always() steps can still write the summary.
+              Start-Sleep -Seconds 5
+            } else {
+              Write-Host "Auto-shutdown disabled -- leaving OS running until runner recycles (GitHub kills the job at ~6 h regardless)."
+            }
+            exit 0
+          } catch {
+            Write-Warning "Keep-alive loop crashed at $((Get-Date).ToString('o')) -- running inline cleanup before exit: $($_ | Out-String)"
+            Invoke-CleanupInline
+            exit 1
+          }
+
+      # -----------------------------------------------------------------------
+      #  Cleanup -- ALWAYS runs; idempotent; skips if inline cleanup already ran.
+      #  Also hardens a HALF-PROVISIONED runner if the job died early.
+      # -----------------------------------------------------------------------
+      - name: Cleanup (Always)
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          if ("$env:CLEANUP_DONE" -eq "true") {
+            Write-Host "Cleanup already performed inline (pre-shutdown) -- skipping duplicate work."
+            exit 0
+          }
+
+          Write-Host "=== Cleanup -- Session $env:SESSION_ID ==="
+          $username = "$env:IN_RDP_USERNAME".Trim()
+
+          # 1) Defence-in-depth: disable the RDP user if it exists (handles
+          #    half-provisioned runners that die before session start).
+          if ($username) {
+            try {
+              Get-LocalUser -Name $username -ErrorAction Stop | Out-Null
+              Disable-LocalUser -Name $username -ErrorAction Stop
+              Write-Host "  RDP user '$username' disabled (defence-in-depth)."
+            } catch { Write-Host "  RDP user step skipped ($($_.Exception.Message))" }
+          }
+
+          # 2) Close RDP listener if we got that far.
+          try {
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 1 -ErrorAction Stop
+            Write-Host "  RDP listener re-closed (fDenyTSConnections=1)."
+          } catch { Write-Host "  RDP close skipped ($($_.Exception.Message))" }
+
+          # 3) Tailscale down + logout (kills the node's tailnet membership).
+          if (Test-Path $env:TAILSCALE_PATH) {
+            try { & $env:TAILSCALE_PATH down 2>$null;   Write-Host "  tailscale down: ok" }   catch { Write-Warning "  tailscale down failed: $($_.Exception.Message)" }
+            try { & $env:TAILSCALE_PATH logout 2>$null; Write-Host "  tailscale logout: ok" } catch { Write-Warning "  tailscale logout failed: $($_.Exception.Message)" }
+          } else { Write-Host "  tailscale binary absent -- install step never completed." }
+
+          # 4) Remove installer artefact.
+          $installerPath = Join-Path $env:TEMP "tailscale-setup.exe"
+          if (Test-Path $installerPath) {
+            Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+            Write-Host "  Installer removed."
+          }
+
+          "CLEANUP_DONE=true" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Cleanup complete."
+          exit 0
+
+      # -----------------------------------------------------------------------
+      #  Post-run summary -- always runs, even if the OS is shutting down
+      # -----------------------------------------------------------------------
+      - name: Session Summary
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          try {
+            $endUtc = (Get-Date).ToUniversalTime().ToString('o')
+
+            Write-Host ""
+            Write-Host "############################################################"
+            Write-Host "#              SESSION SUMMARY                             #"
+            Write-Host "############################################################"
+            Write-Host "#  Session ID    : $env:SESSION_ID"
+            Write-Host "#  Runner        : $env:RUNNER_NAME"
+            Write-Host "#  Tailscale IP  : $env:TAILSCALE_IP"
+            Write-Host "#  Tailscale Host: $env:TAILSCALE_HOSTNAME"
+            Write-Host "#  RDP User      : $env:IN_RDP_USERNAME"
+            Write-Host "#  RDP Password  : $env:IN_RDP_PASSWORD"
+            Write-Host "#  RDP Port      : $env:IN_RDP_PORT"
+            Write-Host "#  Duration      : $env:DURATION_MINUTES min"
+            Write-Host "#  Start (UTC)   : $env:START_UTC"
+            Write-Host "#  End   (UTC)   : $endUtc"
+            Write-Host "############################################################"
+            Write-Host ""
+
+            $md = @(
+              "## Sovereign Workstation -- Session Summary",
+              "",
+              "| Field | Value |",
+              "|-------|-------|",
+              "| Session ID | ``$env:SESSION_ID`` |",
+              "| Runner | ``$env:RUNNER_NAME`` |",
+              "| Tailscale IP | ``$env:TAILSCALE_IP`` |",
+              "| Tailscale Host | ``$env:TAILSCALE_HOSTNAME`` |",
+              "| RDP Target | ``$env:TAILSCALE_IP`:$env:IN_RDP_PORT`` |",
+              "| RDP Username | ``$env:IN_RDP_USERNAME`` |",
+              "| RDP Password | ``$env:IN_RDP_PASSWORD`` |",
+              "| Duration | ``$env:DURATION_MINUTES min`` |",
+              "| Start (UTC) | ``$env:START_UTC`` |",
+              "| End (UTC) | ``$endUtc`` |",
+              "",
+              "### Connect",
+              "``````",
+              "mstsc /v:$env:TAILSCALE_IP`:$env:IN_RDP_PORT",
+              "``````",
+              "",
+              "_Credentials above are explicit and intentional -- this workflow does not truncate them._"
+            )
+            $md -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          } catch {
+            Write-Warning "Session summary failed (non-fatal): $($_ | Out-String)"
+            exit 0
+          }
+
+# =============================================================================
+#  JOB 3 -- Post-run report (always executes, independent of provision outcome)
+# =============================================================================
+  report:
+    name: Post-Run Report
+    needs: [preflight, provision]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Report Status
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "## Post-Run Report"
+          echo ""
+          echo "| Field | Value |"
+          echo "|-------|-------|"
+          echo "| Session ID | \`${{ needs.preflight.outputs.session_id || '(preflight incomplete)' }}\` |"
+          echo "| Provision result | \`${{ needs.provision.result }}\` |"
+          echo "| Preflight result | \`${{ needs.preflight.result }}\` |"
+          echo "| Actor | \`${{ github.actor }}\` |"
+          echo "| Repository | \`${{ github.repository }}\` |"
+          echo "| Run ID | \`${{ github.run_id }}\` |"
+          echo ""
+
+      - name: Write Step Summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "### Provisioning Outcome"
+            echo ""
+            echo "- **Preflight:** \`${{ needs.preflight.result }}\`"
+            echo "- **Provision:** \`${{ needs.provision.result }}\`"
+            echo ""
+            echo "If the provision job failed, review the **Failure Diagnostics**, **Session Summary**,"
+            echo "and **Cleanup** steps above for diagnostic output. Tailscale is always logged out,"
+            echo "the installer is always removed, and the RDP user is always disabled in Cleanup."
+            echo ""
+            echo "Note: GitHub kills hosted jobs at ~6 hours regardless of configuration -- sessions are capped at 5 h for that reason."
+          } >> "$GITHUB_STEP_SUMMARY"

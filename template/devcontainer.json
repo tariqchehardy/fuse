@@ -1,0 +1,24 @@
+{
+  "name": "Sovereign Workstation Codespace (Dedicated Ephemeral Exit Node)",
+  "description": "Linux codespace for the sovereign-workstation stack. Joins the tailnet automatically on start (TS_AUTHKEY secret) and comes up as a dedicated EPHEMERAL Tailscale exit node serving deployed sovereign workstations -- no manual 'tailscale up'. (Codespaces cannot run Windows containers; the Windows SovereignUser/RDP posture is exercised by the GitHub Actions workflow on windows-latest.)",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+  "runArgs": [
+    "--device=/dev/net/tun"
+  ],
+  "features": {
+    "ghcr.io/tailscale/codespace/tailscale": {}
+  },
+  "secrets": {
+    "TS_AUTH_KEY": "TS_AUTHKEY"
+  },
+  "postStartCommand": "bash .devcontainer/tailscale-exit-node.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.powershell",
+        "github.vscode-github-actions",
+        "redhat.vscode-yaml"
+      ]
+    }
+  }
+}

@@ -533,3 +533,28 @@ a { transition: color .14s; }
 .run a:hover, .vm-head a:hover, .gen-link:hover { text-decoration: none; background-size: 100% 1px; }
 footer a { color: var(--muted); text-decoration: none; }
 footer a:hover { color: var(--text); }
+
+/* ---- tenant setup card ---- */
+#setup-body { display: grid; gap: 10px; }
+.setup-row { display: grid; grid-template-columns: 34px 1fr auto; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: rgba(255,255,255,.02); }
+.setup-ic { display: flex; justify-content: center; }
+.setup-tx { display: grid; gap: 3px; min-width: 0; }
+.setup-tx b { font-size: 13.5px; }
+.setup-tx span { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.setup-ac { display: flex; align-items: center; }
+.setup-keyrow { gap: 8px; flex-wrap: wrap; }
+.setup-keyrow input { min-width: 210px; max-width: 100%; }
+#setup-body .fineprint { margin: 2px 0 0; }
+
+/* ---- lifecycle stepper (active VM card) ---- */
+.lifecycle { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 2px; margin: 4px 0 14px; }
+.l-step { font-size: 10.5px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line); white-space: nowrap; }
+.l-step.on { color: #3cf0ba; border-color: rgba(60,240,186,.35); background: rgba(60,240,186,.07); }
+.l-sep { width: 12px; height: 1px; background: var(--line); margin: 0 2px; }
+
+/* ---- run row actions ---- */
+.run-actions { display: flex; align-items: center; gap: 12px; }
+@media (max-width: 640px) {
+  .setup-row { grid-template-columns: 24px 1fr; }
+  .setup-ac { grid-column: 2; }
+}
