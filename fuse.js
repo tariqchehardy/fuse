@@ -5,7 +5,7 @@
    exchange helper — tokens expire in 8h and auto-refresh) or a personal
    access token (advanced, optional). Tokens live only in localStorage. */
 
-const OWNER = "tariqchehardy";
+const OWNER = "Privacy-Technologies";
 const REPO = "sovereign-workstation";
 const WF = "provision-sovereign-workstation.yml";
 const API = "https://api.github.com";
