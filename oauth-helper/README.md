@@ -33,14 +33,14 @@ Requests and approvals are stored in **Deno KV** (free, zero config).
 
 ```bash
 curl https://<your-project>.deno.dev
-# {"configured":true,"client_id":"Iv…","redirect_uri":"https://tariqchehardy.github.io/fuse/","proxy_ready":true,"owner_login":"tariqchehardy"}
+# {"configured":true,"client_id":"Iv…","redirect_uri":"https://fusedispatch.github.io/","proxy_ready":true,"owner_login":"tariqchehardy"}
 ```
 
 `proxy_ready: true` means the multi-user proxy is armed.
 
 ## The GitHub App (one-time setup)
 
-- **Callback URL** and **Homepage URL**: `https://tariqchehardy.github.io/fuse/`
+- **Callback URL** and **Homepage URL**: `https://fusedispatch.github.io/`
 - Repository permissions: **Actions: Read & write**, **Contents: Read-only**,
   **Codespaces: Read & write** (Metadata: Read-only is mandatory).
 - Install the app on the `sovereign-workstation` repo.

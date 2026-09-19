@@ -39,8 +39,8 @@
  * still work unchanged.
  */
 
-const FUSE_ORIGIN = "https://tariqchehardy.github.io";
-const REDIRECT_URI = "https://tariqchehardy.github.io/fuse/";
+const FUSE_ORIGIN = "https://fusedispatch.github.io";
+const REDIRECT_URI = "https://fusedispatch.github.io/";
 const GH = "https://api.github.com";
 const TOKEN_URL = "https://github.com/login/oauth/access_token";
 const UA = "fuse-helper";

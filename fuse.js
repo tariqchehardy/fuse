@@ -14,7 +14,7 @@ const RKEY = "fuse_refresh";   // GitHub App refresh token (rotated on every ref
 const LS_LIMITS = "fuse_limits";
 const OAUTH_EXCHANGE_URL_FALLBACK = "https://untitled.base44.app/functions/githubOauthExchange";
 const OWNER_LOGIN = "tariqchehardy";
-const FUSE_REPO = "tariqchehardy/fuse";                       // public: requests + approval list live here
+const FUSE_REPO = "fusedispatch/fusedispatch.github.io";                       // public: requests + approval list live here
 const APPROVED_URL = "approved.json";                        // static file on Pages (cache-busted)
 const REQ_TITLE = "Access request: ";                        // issue title convention
 // config.json (public, same repo) can point at the live access helper so the

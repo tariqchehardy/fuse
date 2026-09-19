@@ -2,7 +2,7 @@
 
 **F**USE is the dispatch console for [sovereign workstations](https://github.com/tariqchehardy/sovereign-workstation): a single static page hosted on GitHub Pages that talks straight to the GitHub REST API from your browser.
 
-**Console:** https://tariqchehardy.github.io/fuse/
+**Console:** https://fusedispatch.github.io/
 
 ## What it does
 
