@@ -374,13 +374,15 @@ function startOAuth() {
   }
   const state = crypto.randomUUID();
   sessionStorage.setItem("fuse_oauth_state", state);
-  // GitHub App flow: permissions are configured on the app itself,
-  // so no scope parameter is sent.
+  // GitHub App flow: permissions are configured on the app itself, so no
+  // scope parameter is sent. OAuth Apps ("Ov…" client IDs) must request
+  // scopes explicitly, so detect and adapt — either app type works.
   const p = new URLSearchParams({
     client_id: oauthCfg.client_id,
     redirect_uri: oauthCfg.redirect_uri || (location.origin + location.pathname),
     state,
   });
+  if (/^Ov/i.test(oauthCfg.client_id)) p.set("scope", "repo workflow codespace");
   location.href = `https://github.com/login/oauth/authorize?${p}`;
 }
 async function completeOAuth() {
